@@ -134,6 +134,11 @@ pub struct TypeFacts {
     pub elems: Vec<(String, String, Option<TypeExpr>)>,
     /// Go `//go:build` constraint expression, if the file has one.
     pub build_constraint: Option<String>,
+    /// Ruby: start lines of the `def`s in branches the default build (CRuby on x86_64-linux)
+    /// never takes (`if RUBY_ENGINE == "truffleruby"`, `unless Gem.win_platform?` ... `else`).
+    pub off_build: Vec<usize>,
+    /// Ruby: start lines of the `def`s inside `class << self` (class methods written as `def x`).
+    pub singleton_defs: Vec<usize>,
     /// (class, method) for methods that exist without a `def`: Ruby accessors, `Struct` members,
     /// aliases, delegators, `define_method` with a literal name.
     pub methods: Vec<(String, String)>,

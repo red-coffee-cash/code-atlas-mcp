@@ -275,30 +275,43 @@ impl Frontend for RubyFrontend {
             chain.join("::")
         };
         crate::ingestion::parser::walk(root, |n| {
-            // `Point = Struct.new(:x, :y)` and `class Point < Struct.new(:x, :y)`
-            let struct_members = |call: Node| -> Option<Vec<String>> {
-                let r = call.child_by_field_name("receiver")?;
-                let m = call.child_by_field_name("method")?;
-                (call.kind() == "call" && text(r, src) == "Struct" && text(m, src) == "new")
-                    .then(|| symbol_args(call, src))
-            };
+            // `Point = Struct.new(:x, :y)` and `class Point < Struct.new(:x, :y)` (or `Data.define`,
+            // whose members have no writers)
             if n.kind() == "assignment"
                 && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
                 && l.kind() == "constant"
-                && let Some(members) = struct_members(r)
+                && let Some((base, members)) = data_members(r, src)
             {
                 let qn = match enclosing_type(n) {
                     Some(c) => format!("{}::{}", class_qn(c), text(l, src)),
                     None => text(l, src).to_string(),
                 };
-                accessor_methods(&qn, &members, true, &mut facts.methods);
+                accessor_methods(&qn, &members, base == "Struct", &mut facts.methods);
                 facts.classes.push(qn);
             }
             if n.kind() == "class"
                 && let Some(sup) = n.child_by_field_name("superclass").and_then(|s| s.named_child(0))
-                && let Some(members) = struct_members(sup)
+                && let Some((base, members)) = data_members(sup, src)
             {
-                accessor_methods(&class_qn(n), &members, true, &mut facts.methods);
+                accessor_methods(&class_qn(n), &members, base == "Struct", &mut facts.methods);
+            }
+            // `class << self`: its `def x` are class methods
+            if n.kind() == "singleton_class" && n.child_by_field_name("value").is_some_and(|v| v.kind() == "self") {
+                crate::ingestion::parser::walk(n, |d| {
+                    if d.kind() == "method" {
+                        facts.singleton_defs.push(d.start_position().row + 1);
+                    }
+                    d.id() == n.id() || !matches!(d.kind(), "class" | "module" | "singleton_class" | "method")
+                });
+            }
+            // branches the default build never takes
+            if let Some(dead) = off_build_branch(n, src) {
+                crate::ingestion::parser::walk(dead, |d| {
+                    if matches!(d.kind(), "method" | "singleton_method") {
+                        facts.off_build.push(d.start_position().row + 1);
+                    }
+                    true
+                });
             }
             // elements put into instance-variable collections
             if let Some(class) = enclosing_type(n)
@@ -384,10 +397,19 @@ impl Frontend for RubyFrontend {
             };
             let type_name = last_segment(text(name, src)).to_string();
             let line = n.start_position().row + 1;
-            if let Some(sup) = n.child_by_field_name("superclass").and_then(|s| s.named_child(0))
-                && matches!(sup.kind(), "constant" | "scope_resolution")
-            {
-                out.push(ImplRel { type_name: type_name.clone(), trait_name: text(sup, src).to_string(), line });
+            if let Some(sup) = n.child_by_field_name("superclass").and_then(|s| s.named_child(0)) {
+                let base = match sup.kind() {
+                    "constant" | "scope_resolution" => Some(text(sup, src).to_string()),
+                    // `class NoArgument < self` inside `class Switch`
+                    "self" => enclosing_type(n).map(|c| class_name(c, src).to_string()),
+                    // `class Point < Struct.new(:x, :y)`, `< Data.define(:x)`: the members are
+                    // recorded with the type facts, the rest is the built-in's
+                    "call" => data_members(sup, src).map(|(base, _)| base.to_string()),
+                    _ => None,
+                };
+                if let Some(trait_name) = base {
+                    out.push(ImplRel { type_name: type_name.clone(), trait_name, line });
+                }
             }
             if let Some(body) = n.child_by_field_name("body") {
                 let mut cursor = body.walk();
@@ -845,6 +867,117 @@ fn reader_results(class: &str, names: &[String], out: &mut Vec<(String, String, 
 }
 
 /// A reader and, if `writer`, an `x=` writer per name.
+/// The branch of a conditional on the platform that the default build (CRuby 3.3 on x86_64-linux)
+/// never takes: the `then` of a false test, the `else` of a true one.
+fn off_build_branch<'t>(n: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let (cond, then, other, negate) = match n.kind() {
+        "if" | "elsif" => (
+            n.child_by_field_name("condition")?,
+            n.child_by_field_name("consequence"),
+            n.child_by_field_name("alternative"),
+            false,
+        ),
+        "unless" => (
+            n.child_by_field_name("condition")?,
+            n.child_by_field_name("consequence"),
+            n.child_by_field_name("alternative"),
+            true,
+        ),
+        "if_modifier" => (n.child_by_field_name("condition")?, n.child_by_field_name("body"), None, false),
+        "unless_modifier" => (n.child_by_field_name("condition")?, n.child_by_field_name("body"), None, true),
+        _ => return None,
+    };
+    // a taken test skips the whole alternative (`else`, or an `elsif` chain)
+    if platform_test(cond, src)? != negate { other } else { then }
+}
+
+/// A test the default build decides: `RUBY_ENGINE == "jruby"`, `RUBY_VERSION < "2.7"`,
+/// `RUBY_PLATFORM =~ /mswin|mingw/` (or `RbConfig::CONFIG["host_os"]`), `Gem.win_platform?`,
+/// `Gem.java_platform?`, and `!`/`&&`/`||` over them. `None` when it depends on anything else.
+fn platform_test(n: Node, src: &[u8]) -> Option<bool> {
+    const ENGINE: &str = "ruby";
+    const VERSION: [u32; 3] = [3, 3, 0];
+    const PLATFORM: &str = "x86_64-linux";
+    let t = text(n, src).trim();
+    let is_platform = |e: Node| {
+        let t = text(e, src).replace('"', "'");
+        t == "RUBY_PLATFORM" || ["host_os", "target_os", "arch"].iter().any(|k| t == format!("RbConfig::CONFIG['{k}']"))
+    };
+    let string = |e: Node| (e.kind() == "string").then(|| text(e, src).trim_matches(['"', '\'']).to_string());
+    match n.kind() {
+        "parenthesized_statements" => n.named_child(0).and_then(|c| platform_test(c, src)),
+        "unary" if t.starts_with('!') || t.starts_with("not") => {
+            n.child_by_field_name("operand").and_then(|o| platform_test(o, src)).map(|b| !b)
+        }
+        "binary" => {
+            let l = n.child_by_field_name("left")?;
+            let r = n.child_by_field_name("right")?;
+            let op = text(n.child_by_field_name("operator")?, src);
+            match op {
+                "&&" | "and" => match (platform_test(l, src), platform_test(r, src)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                "||" | "or" => match (platform_test(l, src), platform_test(r, src)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                "==" | "!=" if text(l, src) == "RUBY_ENGINE" || text(r, src) == "RUBY_ENGINE" => {
+                    let value = string(if text(l, src) == "RUBY_ENGINE" { r } else { l })?;
+                    Some((value == ENGINE) == (op == "=="))
+                }
+                "<" | "<=" | ">" | ">=" | "==" | "!=" if text(l, src) == "RUBY_VERSION" => {
+                    let value: Vec<u32> = string(r)?.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+                    let have = &VERSION[..value.len().min(3)];
+                    let ord = have.cmp(&value[..value.len().min(3)]);
+                    Some(match op {
+                        "<" => ord.is_lt(),
+                        "<=" => ord.is_le(),
+                        ">" => ord.is_gt(),
+                        ">=" => ord.is_ge(),
+                        "==" => ord.is_eq(),
+                        _ => ord.is_ne(),
+                    })
+                }
+                "=~" => {
+                    let (name, re) = if is_platform(l) { (l, r) } else { (r, l) };
+                    if !is_platform(name) || re.kind() != "regex" {
+                        return None;
+                    }
+                    // a plain alternation of words: `/mswin|mingw|cygwin/`, `/linux/`
+                    let body = text(re, src)
+                        .trim_start_matches('/')
+                        .trim_end_matches(|c: char| c != '/')
+                        .trim_end_matches('/');
+                    body.split('|')
+                        .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                        .then(|| body.split('|').any(|w| PLATFORM.contains(w)))
+                }
+                _ => None,
+            }
+        }
+        "call" if matches!(t, "Gem.win_platform?" | "Gem.java_platform?") => Some(false),
+        _ => None,
+    }
+}
+
+/// `Struct.new(:x, :y)` / `Data.define(:x)`: the built-in it builds on and the member names.
+fn data_members(call: Node, src: &[u8]) -> Option<(&'static str, Vec<String>)> {
+    if call.kind() != "call" {
+        return None;
+    }
+    let r = text(call.child_by_field_name("receiver")?, src);
+    let m = text(call.child_by_field_name("method")?, src);
+    let base = match (r.trim_start_matches("::"), m) {
+        ("Struct", "new") => "Struct",
+        ("Data", "define") => "Data",
+        _ => return None,
+    };
+    Some((base, symbol_args(call, src)))
+}
+
 fn accessor_methods(class: &str, names: &[String], writer: bool, out: &mut Vec<(String, String)>) {
     for n in names {
         out.push((class.to_string(), n.clone()));
@@ -1002,6 +1135,40 @@ Second line."
         assert_eq!(builds.len(), 2);
         assert_ne!(builds[0].symbol_id, builds[1].symbol_id, "def self.build vs build must not collide");
         assert!(builds.iter().all(|b| !b.symbol_id.contains("@L")), "IDs must not depend on line numbers");
+    }
+
+    #[test]
+    fn platform_branches_the_default_build_skips() {
+        let src = r#"class Platform
+  if RUBY_ENGINE == "truffleruby"
+    def self.match_gem?(p, n); 1; end
+  else
+    def self.match_gem?(p, n); 2; end
+  end
+  unless RUBY_ENGINE == 'jruby' || Gem.win_platform?
+    def fast; end
+  end
+  def win; end if RUBY_PLATFORM =~ /mswin|mingw/
+  if RUBY_VERSION < '2.7'
+    def old; end
+  elsif /mswin|cygwin/ =~ RbConfig::CONFIG['host_os']
+    def cyg; end
+  else
+    def now; end
+  end
+  def linux; end if RUBY_PLATFORM =~ /linux/
+  def maybe; end if ENV["X"]
+end
+"#;
+        let p = parse(src);
+        let line = |name: &str, nth: usize| p.symbols.iter().filter(|s| s.name == name).nth(nth).unwrap().start_line;
+        let off = &p.facts.off_build;
+        assert!(off.contains(&line("match_gem?", 0)) && !off.contains(&line("match_gem?", 1)), "{off:?}");
+        assert!(off.contains(&line("win", 0)), "{off:?}");
+        assert!(off.contains(&line("old", 0)) && off.contains(&line("cyg", 0)), "{off:?}");
+        for kept in ["fast", "linux", "maybe", "now"] {
+            assert!(!off.contains(&line(kept, 0)), "{kept}: {off:?}");
+        }
     }
 
     #[test]

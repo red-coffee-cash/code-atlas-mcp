@@ -241,6 +241,12 @@ impl<'a> Index<'a> {
         &self.files[r.0].symbols[r.1]
     }
 
+    /// Whether a Ruby method of file `fi` is a class method: `def self.x`, `def Const.x`, or a
+    /// `def x` inside `class << self`.
+    fn class_method(&self, fi: usize, s: &ParsedSymbol) -> bool {
+        is_singleton_def(&s.signature) || self.files[fi].facts.singleton_defs.contains(&s.start_line)
+    }
+
     /// Definitions named `name` of one of `kinds` in files of `lang` (code calls and names only
     /// its own language's definitions).
     fn candidates(&self, lang: Language, name: &str, kinds: &[&str]) -> Vec<SymRef> {
@@ -503,7 +509,7 @@ fn resolve_ruby(
     // methods. `def self.x` and `def x` can coexist; when the wanted kind exists, keep only it.
     // `None`: no class in the ancestry defines it; `Some([])`: an accessor or alias (no symbol).
     let in_class = |class: &str, class_level: bool| -> Option<Vec<SymRef>> {
-        let singleton = |r: &SymRef| is_singleton_def(&index.sym(*r).signature);
+        let singleton = |r: &SymRef| index.class_method(r.0, index.sym(*r));
         // the nearest definition of the call's level: `pp` on a PP instance skips `def PP.pp` for
         // the `pp` PP mixes in (methods in `class << self` read as instance ones, hence the fallback)
         let level = rb.walk(class, &rb.ancestors, |c| {
@@ -528,7 +534,7 @@ fn resolve_ruby(
     };
     // a class-body DSL call takes symbols naming instance methods (`before_action :x`)
     let self_level =
-        if caller.kind == "class" { call.kind != CallKind::SymbolRef } else { is_singleton_def(&caller.signature) };
+        if caller.kind == "class" { call.kind != CallKind::SymbolRef } else { index.class_method(fi, caller) };
     match call.receiver.as_deref().map(str::trim) {
         // A self call: the caller's class and its ancestors, then (for a module or a base class)
         // the classes that mix it in or extend it, then top-level methods, which are private
@@ -1379,23 +1385,30 @@ const RUBY_CORE_API: &[&str] = &[
 
 /// What a receiver denotes, to gather every method called on the same thing: a local or
 /// parameter within its method, an instance variable within its class, a method result
-/// (`Bundler.ui`, a paren-less `ui`) within the class for self-relative chains and repo-wide for
-/// constant-rooted ones.
+/// (`Bundler.ui`, a paren-less `ui`) within the class for self-relative chains, within the method
+/// for chains on a parameter and repo-wide for constant-rooted ones.
 fn usage_key(call: &CallSite, scope: &str) -> Option<UsageKey> {
     let r = call.receiver.as_deref()?.trim();
     if let Some(TypeExpr::Call(_)) = &call.receiver_type {
         let expr = format!("{:?}", call.receiver_type.as_ref()?);
-        if expr.contains("Param(") {
-            return None; // depends on the method's own parameter
-        }
-        let owner = if expr.contains("Named(\"self") { scope } else { "" };
+        // within its method for a chain on a parameter (each call has its own argument)
+        let owner = if expr.contains("Param(") {
+            call.from_symbol_id.as_str()
+        } else if expr.contains("Named(\"self") {
+            scope
+        } else {
+            ""
+        };
         return Some((owner.to_string(), expr));
     }
     if !is_simple_var(r) {
         return None;
     }
-    let owner = if r.starts_with('@') { scope } else { call.from_symbol_id.as_str() };
-    Some((owner.to_string(), r.to_string()))
+    if r.starts_with('@') {
+        return Some((scope.to_string(), r.to_string()));
+    }
+    // a local is one value per binding: `|s|` in two blocks, or a reassigned name, are two
+    Some((call.from_symbol_id.clone(), format!("{r} {:?}", call.receiver_type)))
 }
 
 /// Whether the method a call names is called on its receiver: not for `items.map(&:name)`, which
@@ -2403,6 +2416,8 @@ impl<'a> RubyModel<'a> {
                     "class" => {
                         m.classes.insert(s.qualified_name.as_str());
                     }
+                    // a `def` the default build skips (`if RUBY_ENGINE == "jruby"`) is never called
+                    "method" if f.facts.off_build.contains(&s.start_line) => {}
                     "method" => m.methods.entry((scope_of(s), s.name.as_str())).or_default().push((fi, si)),
                     _ => {}
                 }
@@ -2668,7 +2683,7 @@ fn infer_ruby_params(index: &Index) {
             let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
             for call in file.calls.iter().filter(|c| !c.arg_types.is_empty()) {
                 let Some(&caller) = by_id.get(call.from_symbol_id.as_str()) else { continue };
-                let self_level = is_singleton_def(&caller.signature);
+                let self_level = index.class_method(fi, caller);
                 let scope = own_scope(caller);
                 let args: Vec<Option<Option<RClasses>>> = call
                     .arg_types
@@ -2743,7 +2758,7 @@ fn ruby_callees(index: &Index, fi: usize, file: &ParsedFile, caller: &ParsedSymb
     }
     let rb = &index.ruby;
     let scope = own_scope(caller);
-    let self_level = is_singleton_def(&caller.signature);
+    let self_level = index.class_method(fi, caller);
     // a value of a known class without the method in the repo
     if call.receiver_type.as_ref().is_some_and(|t| ruby_classes(index, scope, self_level, t, 0).is_some()) {
         return Vec::new();
@@ -3566,6 +3581,10 @@ class Env
   def check(y)
     y.seal
   end
+  def two(specs, deps)
+    specs.each { |s| s.label }
+    deps.each { |s| s.seal }
+  end
 end
 class Pack
   def label; end
@@ -3597,6 +3616,9 @@ end
         let ship: Vec<_> = from("ship").into_iter().filter(|e| e.to.contains("::label#")).collect();
         assert_eq!(ship.len(), 1, "{ship:#?}");
         assert!(ship[0].to.contains("::Pack::") && ship[0].confidence == "STATIC_EXACT");
+        // the two `s` are different values: `label` alone does not single out Pack
+        let two: Vec<_> = from("two").into_iter().filter(|e| e.to.contains("::label#")).collect();
+        assert!(two.len() > 1, "{two:#?}");
     }
 
     #[test]
@@ -3650,6 +3672,74 @@ end
         let text = from("Box::pretty_print", "::text#");
         assert_eq!(text.len(), 2, "{text:#?}");
         assert!(text.iter().all(|e| !e.to.contains("::Other::")));
+    }
+
+    #[test]
+    fn ruby_self_and_struct_superclasses_are_known_ancestors() {
+        let src = "class Switch
+  def parse; end
+  class NoArgument < self
+    def conv; end
+  end
+end
+class Point < Struct.new(:x, :y)
+  def norm; end
+end
+class Shape
+  def norm; end
+  def area; end
+end
+class Use
+  def b(p)
+    p.norm
+    p.area
+  end
+  def c(v)
+    v.conv
+    v.zap
+  end
+end
+";
+        let mut files = vec![parse_as("lib/s.rb", Language::Ruby, src)];
+        let edges = link(&mut files);
+        let from = |caller: &str| {
+            edges.iter().filter(|e| e.from == id(&files, caller) && e.kind == "CALLS").collect::<Vec<_>>()
+        };
+        // a Struct-based class answers its members and the built-in's methods, not `area`
+        let b: Vec<_> = from("b").into_iter().filter(|e| e.to.contains("::norm#")).collect();
+        assert_eq!(b.len(), 1, "{b:#?}");
+        assert!(b[0].to.contains("::Shape::") && b[0].confidence == "STATIC_EXACT");
+        // NoArgument is a Switch, not a class of unknown ancestry: nothing answers `zap`
+        assert!(from("c").is_empty(), "{:#?}", from("c"));
+        let rels: Vec<_> = files[0].impls.iter().map(|r| (r.type_name.as_str(), r.trait_name.as_str())).collect();
+        assert!(rels.contains(&("NoArgument", "Switch")) && rels.contains(&("Point", "Struct")), "{rels:?}");
+    }
+
+    #[test]
+    fn ruby_defs_the_default_build_skips_are_never_targets() {
+        let src = "class Platform\n  if RUBY_ENGINE == \"truffleruby\"\n    def self.match_gem?(p, n); end\n  else\n    def self.match_gem?(p, n); end\n  end\nend\nclass Spec\n  def ok?\n    Platform.match_gem?(1, 2)\n  end\nend\n";
+        let mut files = vec![parse_as("lib/p.rb", Language::Ruby, src)];
+        let edges = link(&mut files);
+        let ok: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "ok?")).collect();
+        assert_eq!(ok.len(), 1, "{ok:#?}");
+        assert_eq!(ok[0].confidence, "STATIC_EXACT");
+        let target = files[0].symbols.iter().find(|s| s.symbol_id == ok[0].to).unwrap();
+        assert_eq!(target.start_line, 5, "the CRuby definition");
+    }
+
+    #[test]
+    fn ruby_class_methods_in_class_self_blocks_are_class_methods() {
+        let src = "class Csv\n  class << self\n    def read(path); end\n    def readlines(path)\n      read(path)\n    end\n  end\n  def read(n); end\n  def line\n    read(1)\n  end\nend\n";
+        let mut files = vec![parse_as("lib/c.rb", Language::Ruby, src)];
+        let edges = link(&mut files);
+        let target = |caller: &str| {
+            let e: Vec<_> = edges.iter().filter(|e| e.from == id(&files, caller)).collect();
+            assert_eq!(e.len(), 1, "{e:#?}");
+            assert_eq!(e[0].confidence, "STATIC_EXACT");
+            files[0].symbols.iter().find(|s| s.symbol_id == e[0].to).unwrap().start_line
+        };
+        assert_eq!(target("readlines"), 3, "the class method");
+        assert_eq!(target("line"), 8, "the instance method");
     }
 
     #[test]
