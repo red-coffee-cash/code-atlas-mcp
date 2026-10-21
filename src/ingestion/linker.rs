@@ -159,6 +159,7 @@ impl<'a> Index<'a> {
             go_dot_imports: vec![HashSet::new(); files.len()],
         };
         let go_packages = GoPackages::build(files, &index.module_keys);
+        let by_path: HashMap<&str, usize> = files.iter().enumerate().map(|(i, f)| (f.rel_path.as_str(), i)).collect();
         for (fi, f) in files.iter().enumerate() {
             if f.language == Language::Go {
                 for imp in &f.imports {
@@ -174,6 +175,15 @@ impl<'a> Index<'a> {
                 continue;
             }
             for imp in &f.imports {
+                // Ruby `require_relative`: an exact file next to the requiring one.
+                if let Some(rel) = imp.module_path.strip_prefix("./") {
+                    let dir = f.rel_path.rsplit_once('/').map_or("", |(d, _)| d);
+                    let target = join_relative(dir, rel, &imp.name);
+                    let found =
+                        [format!("{target}.rb"), target].into_iter().find_map(|p| by_path.get(p.as_str()).copied());
+                    index.imported_files[fi].extend(found.filter(|&t| t != fi));
+                    continue;
+                }
                 let module = normalize_module(&imp.module_path);
                 let mut targets = index.files_for_module(&module);
                 // `use crate::auth::jwt;` imports a module, so the name is part of the path.
@@ -230,6 +240,21 @@ impl<'a> Index<'a> {
             .map(|v| v.iter().copied().filter(|&r| kinds.contains(&self.sym(r).kind)).collect())
             .unwrap_or_default()
     }
+}
+
+/// `dir/rel/name` with `.` and `..` collapsed: (`app/models`, `../lib`, `x`) -> `app/lib/x`.
+fn join_relative(dir: &str, rel: &str, name: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in dir.split('/').chain(rel.split('/')).chain(std::iter::once(name)) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
 }
 
 /// Maps Go import paths to the repo files of that package.
@@ -754,6 +779,28 @@ mod tests {
         assert_eq!(e("name").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
         assert_eq!(e("check").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
         assert_eq!(e("audit").map(|e| e.confidence), Some("STATIC_EXACT"), "receiver-less send stays a self call");
+    }
+
+    #[test]
+    fn ruby_require_relative_resolves_against_the_requiring_file() {
+        let mut files = vec![
+            parse_as("helper.rb", Language::Ruby, "def helper; end\n"),
+            parse_as("app/helper.rb", Language::Ruby, "def helper; end\n"),
+            parse_as("lib/util.rb", Language::Ruby, "def util; end\n"),
+            parse_as("util.rb", Language::Ruby, "def util; end\n"),
+            parse_as(
+                "app/main.rb",
+                Language::Ruby,
+                "require_relative 'helper'\nrequire_relative '../lib/util'\ndef run\n  helper()\n  util()\nend\n",
+            ),
+        ];
+        let edges = link(&mut files);
+        let to = |path: &str, name: &str| calls_between(&edges, &files, ("app/main.rb", "run"), (path, name));
+        assert_eq!(to("app/helper.rb", "helper").map(|e| e.confidence), Some("STATIC_EXACT"));
+        assert!(to("helper.rb", "helper").is_none());
+        assert_eq!(to("lib/util.rb", "util").map(|e| e.confidence), Some("STATIC_EXACT"));
+        assert!(to("util.rb", "util").is_none());
+        assert_eq!(join_relative("app/models", "../lib", "x"), "app/lib/x");
     }
 
     #[test]

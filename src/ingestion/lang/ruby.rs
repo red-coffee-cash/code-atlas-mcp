@@ -68,24 +68,27 @@ impl Frontend for RubyFrontend {
     }
 
     fn param_types(&self, def: Node, src: &[u8]) -> Vec<String> {
+        // `def self.x` and an instance `x` share scope, name and kind; the marker keeps their IDs
+        // apart without the line-number fallback, which would change on unrelated edits.
+        let mut out = Vec::new();
+        if def.kind() == "singleton_method" {
+            out.push("self.".to_string());
+        }
         let Some(params) = def.child_by_field_name("parameters") else {
-            return Vec::new();
+            return out;
         };
         let mut cursor = params.walk();
-        params
-            .named_children(&mut cursor)
-            .filter(|p| p.kind() != "comment")
-            .map(|p| match p.kind() {
-                "splat_parameter" => "*".to_string(),
-                "hash_splat_parameter" => "**".to_string(),
-                "block_parameter" => "&".to_string(),
-                "forward_parameter" => "...".to_string(),
-                "keyword_parameter" => {
-                    format!("kw:{}", p.child_by_field_name("name").map_or("", |n| text(n, src)))
-                }
-                _ => "_".to_string(),
-            })
-            .collect()
+        out.extend(params.named_children(&mut cursor).filter(|p| p.kind() != "comment").map(|p| match p.kind() {
+            "splat_parameter" => "*".to_string(),
+            "hash_splat_parameter" => "**".to_string(),
+            "block_parameter" => "&".to_string(),
+            "forward_parameter" => "...".to_string(),
+            "keyword_parameter" => {
+                format!("kw:{}", p.child_by_field_name("name").map_or("", |n| text(n, src)))
+            }
+            _ => "_".to_string(),
+        }));
+        out
     }
 
     fn visibility(&self, def: Node, src: &[u8]) -> &'static str {
@@ -279,6 +282,10 @@ impl Frontend for RubyFrontend {
             Some((m, n)) => (m.to_string(), n.to_string()),
             None => (String::new(), path.to_string()),
         };
+        // `require_relative` is relative to the requiring file; the linker resolves `./` paths
+        // against its directory.
+        let relative = node.child_by_field_name("method").is_some_and(|m| text(m, src) == "require_relative");
+        let module_path = if relative { format!("./{module_path}") } else { module_path };
         out.push(ImportDecl { module_path, name, alias: None });
     }
 }
@@ -426,6 +433,7 @@ Second line."
         let builds: Vec<_> = p.symbols.iter().filter(|s| s.name == "build").collect();
         assert_eq!(builds.len(), 2);
         assert_ne!(builds[0].symbol_id, builds[1].symbol_id, "def self.build vs build must not collide");
+        assert!(builds.iter().all(|b| !b.symbol_id.contains("@L")), "IDs must not depend on line numbers");
     }
 
     #[test]
@@ -658,7 +666,7 @@ end
         assert_eq!(recv("name", "map").as_deref(), Some("items"), "&:name is called on the elements");
 
         let imp = |m: &str, n: &str| p.imports.iter().any(|i| i.module_path == m && i.name == n);
-        assert!(imp("", "json") && imp("net", "http") && imp("../lib", "helper"));
+        assert!(imp("", "json") && imp("net", "http") && imp("./../lib", "helper"));
         assert!(imp("tasks", "seed") && imp("foo", "bar"));
         assert_eq!(p.imports.len(), 5, "interpolated require is skipped: {:?}", p.imports);
     }
