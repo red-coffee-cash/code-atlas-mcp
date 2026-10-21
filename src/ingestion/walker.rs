@@ -54,6 +54,10 @@ pub struct SourceFile {
     pub line_count: usize,
 }
 
+fn is_vendored(path: &Path, repo_root: &Path) -> bool {
+    path.strip_prefix(repo_root).is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == "vendor"))
+}
+
 /// Returns every supported source file under `repo_root`, sorted by path so downstream
 /// ID assignment and linking are deterministic.
 pub fn scan(repo_root: &Path) -> Result<Vec<SourceFile>> {
@@ -74,6 +78,11 @@ pub fn scan(repo_root: &Path) -> Result<Vec<SourceFile>> {
                 let Some(language) = Language::from_path(entry.path()) else {
                     return WalkState::Continue;
                 };
+                // Vendored dependencies are often committed for these ecosystems (`go mod vendor`,
+                // `bundle --path vendor/bundle`); other languages keep indexing `vendor/` as before.
+                if matches!(language, Language::Go | Language::Ruby) && is_vendored(entry.path(), repo_root) {
+                    return WalkState::Continue;
+                }
                 if entry.metadata().map_or(true, |m| m.len() > MAX_FILE_BYTES) {
                     return WalkState::Continue;
                 }
@@ -151,5 +160,36 @@ mod tests {
         write(dir.path(), "a.rs", "fn a() { 1; }");
         let h2 = scan(dir.path()).unwrap()[0].blake3.clone();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn discovers_go_and_ruby_but_skips_their_vendor_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "cmd/main.go", "package main\n");
+        write(dir.path(), "vendor/dep/dep.go", "package dep\n");
+        write(dir.path(), "vendor/crate/lib.rs", "fn v() {}\n");
+        write(dir.path(), "lib/a.rb", "class A; end\n");
+        write(dir.path(), "tasks/x.rake", "task :x\n");
+        write(dir.path(), "Rakefile", "task :default\n");
+        write(dir.path(), "Gemfile", "source 'https://rubygems.org'\n");
+        write(dir.path(), "a.gemspec", "Gem::Specification.new\n");
+        write(dir.path(), "vendor/bundle/gem.rb", "class G; end\n");
+
+        let files = scan(dir.path()).unwrap();
+        let got: Vec<_> = files.iter().map(|f| (f.rel_path.as_str(), f.language)).collect();
+        assert_eq!(
+            got,
+            [
+                ("Gemfile", Language::Ruby),
+                ("Rakefile", Language::Ruby),
+                ("a.gemspec", Language::Ruby),
+                ("cmd/main.go", Language::Go),
+                ("lib/a.rb", Language::Ruby),
+                ("tasks/x.rake", Language::Ruby),
+                ("vendor/crate/lib.rs", Language::Rust),
+            ]
+        );
+        assert_eq!(Language::Go.as_str(), "go");
+        assert_eq!(Language::Ruby.as_str(), "ruby");
     }
 }
