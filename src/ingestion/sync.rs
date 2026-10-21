@@ -44,6 +44,7 @@ pub fn sync_repository(db: &DbInstance, repo_root: &Path) -> Result<SyncReport> 
     report.files_failed = failed;
     report.files_unsupported = unsupported;
 
+    assign_go_package_paths(repo_root, &mut parsed);
     let linked = linker::link(&mut parsed);
 
     let old_symbols = queries::symbol_ids(db)?;
@@ -109,6 +110,92 @@ pub fn sync_repository(db: &DbInstance, repo_root: &Path) -> Result<SyncReport> 
     report.cyclic_scc_count = topo.cyclic_scc_count;
     report.max_topological_level = topo.max_level;
     Ok(report)
+}
+
+/// Sets `package_path` on Go files from the nearest enclosing `go.mod`, so imports resolve to repo
+/// packages exactly instead of by directory-name suffix.
+fn assign_go_package_paths(repo_root: &Path, files: &mut [ParsedFile]) {
+    let mut cache: HashMap<String, Option<(String, String)>> = HashMap::new();
+    // The repo may be a subtree of a module (a monorepo checkout, a stdlib directory): then the
+    // module's go.mod sits above the root, and in-repo paths extend the root's import path.
+    let mut root_path = None;
+    let mut computed_root = false;
+    for f in files.iter_mut().filter(|f| f.language == walker::Language::Go) {
+        let dir = f.rel_path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        f.package_path = match go_module_of(repo_root, &dir, &mut cache) {
+            Some((module, module_dir)) => {
+                let rest = dir.strip_prefix(module_dir.as_str()).map_or("", |r| r.trim_start_matches('/'));
+                Some(go_join(&go_module_prefix(&module), rest))
+            }
+            None => {
+                if !computed_root {
+                    root_path = go_import_path_of_dir(repo_root);
+                    computed_root = true;
+                }
+                root_path.as_deref().map(|r| go_join(r, &dir))
+            }
+        };
+    }
+}
+
+/// The import-path prefix of a module's packages. The standard library's module (`std`) is
+/// imported without a prefix (`net/http`, not `std/net/http`).
+fn go_module_prefix(module: &str) -> String {
+    if module == "std" { String::new() } else { module.to_string() }
+}
+
+fn go_join(prefix: &str, rest: &str) -> String {
+    match (prefix.is_empty(), rest.is_empty()) {
+        (true, _) => rest.to_string(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}/{rest}"),
+    }
+}
+
+/// The import path of `dir` from the nearest go.mod in it or above it.
+fn go_import_path_of_dir(dir: &Path) -> Option<String> {
+    let dir = dir.canonicalize().ok()?;
+    let mut tail: Vec<String> = Vec::new();
+    let mut cur = dir.as_path();
+    loop {
+        if let Some(module) = std::fs::read_to_string(cur.join("go.mod")).ok().and_then(|g| go_mod_module(&g)) {
+            tail.reverse();
+            return Some(go_join(&go_module_prefix(&module), &tail.join("/")));
+        }
+        tail.push(cur.file_name()?.to_string_lossy().into_owned());
+        cur = cur.parent()?;
+    }
+}
+
+fn go_mod_module(gomod: &str) -> Option<String> {
+    gomod.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("module")
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .map(|r| r.trim().trim_matches('"').to_string())
+    })
+}
+
+/// `(module path, repo-relative directory of its go.mod)` for the module containing `dir`.
+fn go_module_of(
+    repo_root: &Path,
+    dir: &str,
+    cache: &mut HashMap<String, Option<(String, String)>>,
+) -> Option<(String, String)> {
+    if let Some(hit) = cache.get(dir) {
+        return hit.clone();
+    }
+    let here = std::fs::read_to_string(repo_root.join(dir).join("go.mod"))
+        .ok()
+        .and_then(|gomod| go_mod_module(&gomod))
+        .map(|m| (m, dir.to_string()));
+    let found = match here {
+        Some(m) => Some(m),
+        None if dir.is_empty() => None,
+        None => go_module_of(repo_root, dir.rsplit_once('/').map_or("", |(d, _)| d), cache),
+    };
+    cache.insert(dir.to_string(), found.clone());
+    found
 }
 
 /// Parses in parallel; returns files in input order plus failure and unsupported counts.
@@ -271,6 +358,76 @@ mod tests {
         assert_eq!(get("top")[1].get_int(), Some(2));
         assert_eq!(get("top")[2].get_str(), Some("UNMAPPED"));
         assert_eq!(run(&db, "?[c] := *file_node{line_count: c}")[0][0].get_int(), Some(3));
+    }
+
+    #[test]
+    fn go_files_sync_with_cross_package_edges_and_vendor_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "internal/auth/auth.go", "package auth\n\nfunc Verify() {}\n");
+        write(
+            dir.path(),
+            "cmd/app/main.go",
+            "package main\n\nimport \"example.com/app/internal/auth\"\n\nfunc main() { auth.Verify() }\n",
+        );
+        write(dir.path(), "vendor/dep/dep.go", "package dep\n\nfunc Dep() {}\n");
+        let db = schema::open_in_memory().unwrap();
+
+        let r = sync_repository(&db, dir.path()).unwrap();
+        assert_eq!((r.files_scanned, r.files_parsed, r.files_unsupported), (2, 2, 0));
+        assert_eq!((r.symbols_total, r.edges_total), (2, 1));
+        let ep = run(&db, "?[n] := *symbol_node{name: n, is_entrypoint: true}");
+        assert_eq!(ep.len(), 1);
+        assert_eq!(ep[0][0].get_str(), Some("main"));
+    }
+
+    #[test]
+    fn ruby_files_sync_with_self_calls_mixins_and_vendor_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/mixin.rb", "module Mixin\n  def shared; end\nend\n");
+        write(
+            dir.path(),
+            "app/controllers/users_controller.rb",
+            "require 'mixin'\nclass UsersController < ApplicationController\n  include Mixin\n  before_action :auth\n  def index\n    load_users()\n  end\n  private\n  def auth; end\n  def load_users; end\nend\n",
+        );
+        write(dir.path(), "Rakefile", "def helper; end\n");
+        write(dir.path(), "vendor/bundle/gem.rb", "class Gem; end\n");
+        let db = schema::open_in_memory().unwrap();
+
+        let r = sync_repository(&db, dir.path()).unwrap();
+        assert_eq!((r.files_scanned, r.files_parsed, r.files_unsupported), (3, 3, 0));
+        let ep = run(&db, "?[n] := *symbol_node{name: n, is_entrypoint: true}");
+        assert_eq!(ep.len(), 1, "{ep:?}");
+        assert_eq!(ep[0][0].get_str(), Some("index"));
+        let calls = run(
+            &db,
+            "?[a, b] := *symbol_edge{from_symbol_id: x, to_symbol_id: y, edge_kind: 'CALLS'}, *symbol_node{symbol_id: x, name: a}, *symbol_node{symbol_id: y, name: b}",
+        );
+        let has = |a: &str, b: &str| calls.iter().any(|r| r[0].get_str() == Some(a) && r[1].get_str() == Some(b));
+        assert!(has("index", "load_users"), "{calls:?}");
+    }
+
+    #[test]
+    fn go_mod_module_path_resolves_imports_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/app\n\ngo 1.22\n");
+        write(dir.path(), "auth/auth.go", "package auth\n\nfunc Verify() {}\n");
+        write(dir.path(), "errors/errors.go", "package errors\n\nfunc New(s string) error { return nil }\n");
+        write(
+            dir.path(),
+            "cmd/app/main.go",
+            "package main\n\nimport (\n\t\"errors\"\n\tauth \"github.com/other/auth\"\n\tmine \"example.com/app/auth\"\n)\n\nfunc main() {\n\terrors.New(\"x\")\n\tauth.Verify()\n\tmine.Verify()\n}\n",
+        );
+        let db = schema::open_in_memory().unwrap();
+
+        sync_repository(&db, dir.path()).unwrap();
+        let calls = run(
+            &db,
+            "?[a, b, c] := *symbol_edge{from_symbol_id: x, to_symbol_id: y, edge_kind: 'CALLS', confidence: c}, \
+             *symbol_node{symbol_id: x, name: a}, *symbol_node{symbol_id: y, name: b}",
+        );
+        // only the import of the repo's own module links; stdlib `errors` and the external `auth` do not
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0][1].get_str(), calls[0][2].get_str()), (Some("Verify"), Some("STATIC_EXACT")));
     }
 
     #[test]

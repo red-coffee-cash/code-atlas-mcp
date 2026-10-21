@@ -58,6 +58,8 @@ pub fn parse_file(file: &SourceFile) -> Result<Option<ParsedFile>> {
         type_refs: Vec::new(),
         imports: Vec::new(),
         impls: fe.implements(root, src),
+        package_path: None,
+        facts: fe.type_facts(root, src),
     };
 
     apply_risks(&compiled.risks, root, src, &mut symbols, &spans);
@@ -141,7 +143,11 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
                 start: def.start_byte(),
                 end: def.end_byte(),
                 params: range(fe.function_node(def).child_by_field_name("parameters")),
-                ret: range(fe.function_node(def).child_by_field_name("return_type")),
+                ret: range(
+                    fe.function_node(def)
+                        .child_by_field_name("return_type")
+                        .or_else(|| fe.function_node(def).child_by_field_name("result")),
+                ),
             },
             sym: ParsedSymbol {
                 symbol_id,
@@ -161,6 +167,7 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
                 risk_flags: Vec::new(),
                 requires_strict_contract: false,
                 is_entrypoint,
+                arity: fe.arity(def, src),
             },
         });
     }
@@ -169,7 +176,13 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
 
 /// Declaration header without the body.
 fn signature(fe: &dyn Frontend, def: Node, src: &[u8], kind: &str) -> String {
-    let end = fe.function_node(def).child_by_field_name("body").map_or(def.end_byte(), |b| b.start_byte());
+    let f = fe.function_node(def);
+    let mut end = f.child_by_field_name("body").map_or(def.end_byte(), |b| b.start_byte());
+    // a comment between the header and the body (`module M # doc`, `def f():  # note`) is not
+    // part of the declaration
+    if let Some(c) = f.children(&mut f.walk()).find(|c| c.is_extra() && c.start_byte() < end) {
+        end = c.start_byte();
+    }
     let raw = String::from_utf8_lossy(&src[def.start_byte()..end]);
     // A const/static initialiser isn't part of the declaration header; a function's default
     // parameters (`x: int = 1`) are.
@@ -247,6 +260,17 @@ fn last_segment(t: &str) -> &str {
     t.rsplit([':', '.']).next().unwrap_or(t).trim_end_matches('!')
 }
 
+/// The object a Ruby symbol ref names a method of. `obj.send(:x)` / `obj.try(:x)` -> `obj`;
+/// `send(:x)` and `before_action :x` -> self (`None`); `xs.map(&:x)` calls `x` on each element of
+/// `xs`, never on self, so it gets the placeholder `_` unless the collection has a name.
+fn symbol_ref_receiver(sym: Node, src: &[u8]) -> Option<String> {
+    let parent = sym.parent()?;
+    let to_proc = parent.kind() == "block_argument";
+    let call = if to_proc { parent.parent()?.parent()? } else { parent.parent()? };
+    let named = call.child_by_field_name("receiver").map(|r| snippet(r, src));
+    if to_proc { Some(named.filter(|r| r != "self").unwrap_or_else(|| "_".to_string())) } else { named }
+}
+
 fn extract_calls(
     fe: &dyn Frontend,
     query: &Query,
@@ -285,6 +309,11 @@ fn extract_calls(
                 from_symbol_id: symbols[i].sym.symbol_id.clone(),
                 type_name: text(t, src).to_string(),
                 kind,
+                qualifier: t
+                    .parent()
+                    .filter(|p| p.kind() == "qualified_type")
+                    .and_then(|p| p.child_by_field_name("package"))
+                    .map(|q| text(q, src).to_string()),
             });
             continue;
         }
@@ -299,31 +328,59 @@ fn extract_calls(
         let line = anchor.start_position().row + 1;
 
         if let (Some(site), Some(target)) = (cap("call.site"), cap("call.target_name")) {
+            // `x.foo = v` (Ruby) calls the setter `foo=` with `v`, not the reader `foo`
+            let setter = site
+                .parent()
+                .filter(|p| {
+                    p.kind() == "assignment" && p.child_by_field_name("left").is_some_and(|l| l.id() == site.id())
+                })
+                .and_then(|p| p.child_by_field_name("right"));
             out.calls.push(CallSite {
                 from_symbol_id: from,
-                target_name: text(target, src).to_string(),
+                target_name: match setter {
+                    Some(_) => format!("{}=", text(target, src)),
+                    None => text(target, src).to_string(),
+                },
                 receiver: cap("call.receiver").map(|r| snippet(r, src)),
                 line,
-                snippet: snippet(site, src),
+                snippet: snippet(site.parent().filter(|_| setter.is_some()).unwrap_or(site), src),
                 kind: CallKind::Direct,
                 via: None,
+                receiver_type: cap("call.receiver").and_then(|r| fe.receiver_type(r, src)),
+                args: match setter {
+                    Some(_) => Some(CallArgs { positional: 1, keywords: false }),
+                    None => fe.call_args(site, src),
+                },
+                arg_types: match setter {
+                    Some(v) => vec![fe.receiver_type(v, src)],
+                    None => fe.call_arg_types(site, src),
+                },
             });
         } else if let Some(r) = cap("call.callback_ref") {
             // `Self::handler`, `self.handler`, `mod.handler` carry a qualifier; a bare `handler`
             // can only be a free function (or a local variable).
             let qualifier = r.parent().and_then(|p| {
-                matches!(p.kind(), "scoped_identifier" | "attribute" | "member_expression")
-                    .then(|| p.child_by_field_name("path").or_else(|| p.child_by_field_name("object")))
+                matches!(p.kind(), "scoped_identifier" | "attribute" | "member_expression" | "selector_expression")
+                    .then(|| {
+                        p.child_by_field_name("path")
+                            .or_else(|| p.child_by_field_name("object"))
+                            .or_else(|| p.child_by_field_name("operand"))
+                    })
                     .flatten()
             });
+            let symbol_ref = r.kind() == "simple_symbol";
+            let receiver = if symbol_ref { symbol_ref_receiver(r, src) } else { qualifier.map(|q| snippet(q, src)) };
             out.calls.push(CallSite {
                 from_symbol_id: from,
-                target_name: text(r, src).to_string(),
-                receiver: qualifier.map(|q| snippet(q, src)),
+                target_name: text(r, src).trim_start_matches(':').to_string(),
+                receiver,
                 line,
                 snippet: snippet(r.parent().unwrap_or(r), src),
-                kind: CallKind::Callback,
+                kind: if symbol_ref { CallKind::SymbolRef } else { CallKind::Callback },
                 via: cap("call.callback_via").map(|v| last_segment(text(v, src)).to_string()),
+                receiver_type: if symbol_ref { None } else { qualifier.and_then(|q| fe.receiver_type(q, src)) },
+                args: None,
+                arg_types: Vec::new(),
             });
         } else if let (Some(name), Some(tokens)) = (cap("macro.name"), cap("macro.tokens")) {
             let macro_name = last_segment(text(name, src)).to_string();
@@ -343,6 +400,9 @@ fn extract_calls(
                         snippet: format!("{macro_name}!(…{}…)", text(n, src)),
                         kind: CallKind::MacroIdent,
                         via: Some(macro_name.clone()),
+                        receiver_type: None,
+                        args: None,
+                        arg_types: Vec::new(),
                     });
                 }
                 true

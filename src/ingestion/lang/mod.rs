@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Query};
 
-use super::model::{ImplRel, ImportDecl};
+use super::model::{Arity, CallArgs, ImplRel, ImportDecl, TypeExpr, TypeFacts};
 use super::walker::{Language, SourceFile};
 
 pub mod go;
@@ -59,6 +59,31 @@ pub trait Frontend: Sync {
         Vec::new()
     }
 
+    /// Positional parameters a definition accepts.
+    fn arity(&self, _def: Node, _src: &[u8]) -> Option<Arity> {
+        None
+    }
+
+    /// The argument shape of a call site.
+    fn call_args(&self, _site: Node, _src: &[u8]) -> Option<CallArgs> {
+        None
+    }
+
+    /// The types of a call's positional arguments, as far as the caller's code shows them.
+    fn call_arg_types(&self, _site: Node, _src: &[u8]) -> Vec<Option<TypeExpr>> {
+        Vec::new()
+    }
+
+    /// The receiver's type as far as the enclosing code shows it (parameters, locals, literals).
+    fn receiver_type(&self, _receiver: Node, _src: &[u8]) -> Option<TypeExpr> {
+        None
+    }
+
+    /// File-level declarations that type receivers in other files (fields, results, globals).
+    fn type_facts(&self, _root: Node, _src: &[u8]) -> TypeFacts {
+        TypeFacts::default()
+    }
+
     /// Whether a macro invocation wraps external I/O or unsafe code (spec §10.3).
     fn macro_is_risky(&self, _macro_name: &str, _tokens: Node, _src: &[u8]) -> bool {
         false
@@ -92,6 +117,11 @@ pub fn risk_flag_for_capture(suffix: &str) -> Option<&'static str> {
         "alloc" => "manual_alloc",
         _ => return None,
     })
+}
+
+/// A comment on a line of its own, not trailing code (`A = 1 // first`); only those can be docs.
+pub(crate) fn own_line(comment: Node) -> bool {
+    comment.prev_sibling().is_none_or(|p| p.end_position().row < comment.start_position().row)
 }
 
 pub(crate) fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {
