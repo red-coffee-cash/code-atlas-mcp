@@ -561,7 +561,17 @@ fn resolve_ruby(
             // A value of unknown type: any class that responds to the name, counting the methods
             // that have no `def` (accessors, Struct members). Too many responders is too generic
             // to link, and when an accessor could be the target no `def` is certain.
-            if RUBY_CORE_METHODS.contains(&name) {
+            // Everything this method calls on the same variable (not when guarded by `respond_to?`).
+            let usage = rb.usage.borrow();
+            let used = usage_key(call, scope)
+                .filter(|_| calls_on_receiver(call))
+                .and_then(|k| usage.get(&k))
+                .filter(|u| !u.1)
+                .map(|u| &u.0);
+            // A core method on a value only ever used through core methods: as likely the
+            // runtime's own definition as any repo one. One non-core method shows a repo object.
+            let core = |m: &str| RUBY_CORE_API.binary_search(&m).is_ok();
+            if core(name) && used.is_none_or(|u| u.iter().all(|m| core(m))) {
                 return Some(None);
             }
             let mut responders: Vec<&str> =
@@ -573,7 +583,7 @@ fn resolve_ruby(
             // Structural typing from usage: everything this method calls on the same variable
             // must be answered by its class (or no program run reaches the calls without a
             // NoMethodError). Not applied when guarded by `respond_to?`.
-            if let Some((used, false)) = usage_key(call, scope).and_then(|k| rb.usage.get(&k))
+            if let Some(used) = used
                 && used.len() > 1
             {
                 // no repo class answers them all: the value is an object from outside the repo
@@ -717,149 +727,642 @@ fn ruby_classes(index: &Index, scope: &str, self_level: bool, ty: &TypeExpr, dep
     }
 }
 
-/// Methods every Ruby value (Object, Kernel, Comparable) or the ubiquitous core collections and
-/// scalars (Enumerable, Array, Hash, String, Integer, IO) define. On a receiver of unknown type the
-/// runtime's own definitions are as likely as any repo one, so such a call is too generic to link.
-const RUBY_CORE_METHODS: &[&str] = &[
-    "new",
-    "initialize",
-    "class",
-    "to_s",
-    "inspect",
-    "hash",
-    "==",
+/// The public instance methods of Object, which an instance of every class answers.
+const RUBY_OBJECT_API: &[&str] = &[
+    "!",
     "!=",
+    "!~",
+    "<=>",
+    "==",
     "===",
-    "=~",
+    "__id__",
+    "__send__",
+    "class",
+    "clone",
+    "define_singleton_method",
+    "display",
+    "dup",
+    "enum_for",
     "eql?",
     "equal?",
-    "<=>",
-    "<",
-    ">",
-    "<=",
-    ">=",
-    "nil?",
-    "is_a?",
-    "kind_of?",
-    "instance_of?",
-    "respond_to?",
-    "send",
-    "public_send",
-    "dup",
-    "clone",
+    "extend",
     "freeze",
     "frozen?",
-    "tap",
-    "then",
-    "object_id",
+    "hash",
+    "inspect",
+    "instance_eval",
+    "instance_exec",
+    "instance_of?",
+    "instance_variable_defined?",
     "instance_variable_get",
     "instance_variable_set",
+    "instance_variables",
+    "is_a?",
+    "itself",
+    "kind_of?",
     "method",
     "methods",
-    "extend",
-    "display",
-    "to_a",
-    "to_h",
-    "to_str",
-    "to_sym",
-    "to_i",
-    "to_f",
-    "to_proc",
-    "each",
-    "each_with_index",
-    "each_with_object",
-    "map",
-    "flat_map",
-    "select",
-    "filter",
-    "reject",
-    "find",
-    "detect",
-    "find_all",
-    "include?",
-    "member?",
-    "any?",
-    "all?",
-    "none?",
-    "count",
-    "first",
-    "last",
-    "min",
-    "max",
-    "sort",
-    "sort_by",
-    "group_by",
-    "partition",
-    "reduce",
-    "inject",
-    "sum",
-    "zip",
-    "take",
-    "drop",
-    "uniq",
-    "compact",
-    "flatten",
-    "reverse",
-    "empty?",
-    "size",
-    "length",
+    "nil?",
+    "object_id",
+    "private_methods",
+    "protected_methods",
+    "public_method",
+    "public_methods",
+    "public_send",
+    "remove_instance_variable",
+    "respond_to?",
+    "send",
+    "singleton_class",
+    "singleton_method",
+    "singleton_methods",
+    "tap",
+    "then",
+    "to_enum",
+    "to_s",
+    "yield_self",
+];
+
+/// Ruby's built-in classes and modules. A repo that reopens one (`class Array`, `module
+/// Enumerable`) shows only its own additions, so the class answers more than the repo shows.
+const RUBY_BUILTINS: &[&str] = &[
+    "ArgumentError",
+    "Array",
+    "BasicObject",
+    "Binding",
+    "Class",
+    "ClosedQueueError",
+    "Comparable",
+    "Complex",
+    "ConditionVariable",
+    "Data",
+    "Dir",
+    "EOFError",
+    "Encoding",
+    "EncodingError",
+    "Enumerable",
+    "Enumerator",
+    "Errno",
+    "Exception",
+    "FalseClass",
+    "Fiber",
+    "FiberError",
+    "File",
+    "FileTest",
+    "Float",
+    "FloatDomainError",
+    "FrozenError",
+    "GC",
+    "Hash",
+    "IO",
+    "IOError",
+    "IndexError",
+    "Integer",
+    "Interrupt",
+    "Kernel",
+    "KeyError",
+    "LoadError",
+    "LocalJumpError",
+    "Marshal",
+    "MatchData",
+    "Math",
+    "Method",
+    "Module",
+    "Mutex",
+    "NameError",
+    "NilClass",
+    "NoMatchingPatternError",
+    "NoMatchingPatternKeyError",
+    "NoMemoryError",
+    "NoMethodError",
+    "NotImplementedError",
+    "Numeric",
+    "Object",
+    "ObjectSpace",
+    "Proc",
+    "Process",
+    "Queue",
+    "Ractor",
+    "Random",
+    "Range",
+    "RangeError",
+    "Rational",
+    "Refinement",
+    "Regexp",
+    "RegexpError",
+    "RubyVM",
+    "RuntimeError",
+    "ScriptError",
+    "SecurityError",
+    "Signal",
+    "SignalException",
+    "SizedQueue",
+    "StandardError",
+    "StopIteration",
+    "String",
+    "Struct",
+    "Symbol",
+    "SyntaxError",
+    "SystemCallError",
+    "SystemExit",
+    "SystemStackError",
+    "Thread",
+    "ThreadError",
+    "ThreadGroup",
+    "Time",
+    "TracePoint",
+    "TrueClass",
+    "TypeError",
+    "UnboundMethod",
+    "UncaughtThrowError",
+    "Warning",
+    "ZeroDivisionError",
+];
+
+/// The public instance methods of the core classes an untyped value most often is (Object, Kernel,
+/// Comparable, Enumerable, Array, Hash, String, Symbol, Integer, Float, IO, Exception, Proc), as
+/// Ruby 3.3 lists them. Sorted, for `binary_search`.
+const RUBY_CORE_API: &[&str] = &[
+    "!",
+    "!=",
+    "!~",
+    "%",
+    "&",
+    "*",
+    "**",
+    "+",
+    "+@",
+    "-",
+    "-@",
+    "/",
+    "<",
+    "<<",
+    "<=",
+    "<=>",
+    "==",
+    "===",
+    "=~",
+    ">",
+    ">=",
+    ">>",
     "[]",
     "[]=",
-    "<<",
-    "push",
-    "pop",
-    "shift",
-    "unshift",
-    "concat",
-    "delete",
-    "clear",
-    "fetch",
-    "dig",
-    "key?",
-    "has_key?",
-    "keys",
-    "values",
-    "merge",
-    "merge!",
-    "update",
-    "join",
-    "split",
-    "strip",
-    "chomp",
-    "sub",
-    "gsub",
-    "start_with?",
-    "end_with?",
-    "match",
-    "match?",
-    "upcase",
-    // Exception
-    "message",
-    "full_message",
-    "detailed_message",
+    "^",
+    "__id__",
+    "__send__",
+    "abs",
+    "abs2",
+    "advise",
+    "all?",
+    "allbits?",
+    "angle",
+    "any?",
+    "anybits?",
+    "append",
+    "arg",
+    "arity",
+    "ascii_only?",
+    "assoc",
+    "at",
+    "autoclose=",
+    "autoclose?",
+    "b",
     "backtrace",
     "backtrace_locations",
-    "cause",
-    "exception",
-    "downcase",
-    "+",
-    "-",
-    "*",
-    "/",
-    "%",
-    "read",
-    "write",
-    "close",
-    "puts",
-    "print",
+    "between?",
+    "binding",
+    "binmode",
+    "binmode?",
+    "bit_length",
+    "bsearch",
+    "bsearch_index",
+    "byteindex",
+    "byterindex",
+    "bytes",
+    "bytesize",
+    "byteslice",
+    "bytesplice",
     "call",
+    "capitalize",
+    "capitalize!",
+    "casecmp",
+    "casecmp?",
+    "cause",
+    "ceil",
+    "ceildiv",
+    "center",
+    "chain",
+    "chars",
+    "chomp",
+    "chomp!",
+    "chop",
+    "chop!",
+    "chr",
+    "chunk",
+    "chunk_while",
+    "clamp",
+    "class",
+    "clear",
+    "clone",
+    "close",
+    "close_on_exec=",
+    "close_on_exec?",
+    "close_read",
+    "close_write",
+    "closed?",
+    "codepoints",
+    "coerce",
+    "collect",
+    "collect!",
+    "collect_concat",
+    "combination",
+    "compact",
+    "compact!",
+    "compare_by_identity",
+    "compare_by_identity?",
+    "concat",
+    "conj",
+    "conjugate",
+    "count",
+    "crypt",
+    "curry",
+    "cycle",
+    "deconstruct",
+    "deconstruct_keys",
+    "dedup",
+    "default",
+    "default=",
+    "default_proc",
+    "default_proc=",
+    "define_singleton_method",
+    "delete",
+    "delete!",
+    "delete_at",
+    "delete_if",
+    "delete_prefix",
+    "delete_prefix!",
+    "delete_suffix",
+    "delete_suffix!",
+    "denominator",
+    "detailed_message",
+    "detect",
+    "difference",
+    "dig",
+    "digits",
+    "display",
+    "div",
+    "divmod",
+    "downcase",
+    "downcase!",
+    "downto",
+    "drop",
+    "drop_while",
+    "dump",
+    "dup",
+    "each",
+    "each_byte",
+    "each_char",
+    "each_codepoint",
+    "each_cons",
+    "each_entry",
+    "each_grapheme_cluster",
+    "each_index",
+    "each_key",
+    "each_line",
+    "each_pair",
+    "each_slice",
+    "each_value",
+    "each_with_index",
+    "each_with_object",
+    "empty?",
+    "encode",
+    "encode!",
+    "encoding",
+    "end_with?",
+    "entries",
+    "enum_for",
+    "eof",
+    "eof?",
+    "eql?",
+    "equal?",
+    "even?",
+    "except",
+    "exception",
+    "extend",
+    "external_encoding",
+    "fcntl",
+    "fdatasync",
+    "fdiv",
+    "fetch",
+    "fetch_values",
+    "fileno",
+    "fill",
+    "filter",
+    "filter!",
+    "filter_map",
+    "find",
+    "find_all",
+    "find_index",
+    "finite?",
+    "first",
+    "flat_map",
+    "flatten",
+    "flatten!",
+    "floor",
+    "flush",
+    "force_encoding",
+    "freeze",
+    "frozen?",
+    "fsync",
+    "full_message",
+    "gcd",
+    "gcdlcm",
+    "getbyte",
+    "getc",
+    "gets",
+    "grapheme_clusters",
+    "grep",
+    "grep_v",
+    "group_by",
+    "gsub",
+    "gsub!",
+    "has_key?",
+    "has_value?",
+    "hash",
+    "hex",
+    "i",
+    "id2name",
+    "imag",
+    "imaginary",
+    "include?",
+    "index",
+    "infinite?",
+    "initialize",
+    "inject",
+    "insert",
+    "inspect",
+    "instance_eval",
+    "instance_exec",
+    "instance_of?",
+    "instance_variable_defined?",
+    "instance_variable_get",
+    "instance_variable_set",
+    "instance_variables",
+    "integer?",
+    "intern",
+    "internal_encoding",
+    "intersect?",
+    "intersection",
+    "invert",
+    "ioctl",
+    "is_a?",
+    "isatty",
+    "itself",
+    "join",
+    "keep_if",
+    "key",
+    "key?",
+    "keys",
+    "kind_of?",
+    "lambda?",
+    "last",
+    "lazy",
+    "lcm",
+    "length",
+    "lineno",
+    "lineno=",
+    "lines",
+    "ljust",
+    "lstrip",
+    "lstrip!",
+    "magnitude",
+    "map",
+    "map!",
+    "match",
+    "match?",
+    "max",
+    "max_by",
+    "member?",
+    "merge",
+    "merge!",
+    "message",
+    "method",
+    "methods",
+    "min",
+    "min_by",
+    "minmax",
+    "minmax_by",
+    "modulo",
+    "name",
+    "nan?",
+    "negative?",
+    "new",
+    "next",
+    "next!",
+    "next_float",
+    "nil?",
+    "nobits?",
+    "none?",
+    "nonzero?",
+    "numerator",
+    "object_id",
+    "oct",
+    "odd?",
+    "one?",
+    "ord",
+    "pack",
+    "parameters",
+    "partition",
+    "path",
+    "permutation",
+    "phase",
+    "pid",
+    "polar",
+    "pop",
+    "pos",
+    "pos=",
+    "positive?",
+    "pow",
+    "pread",
+    "pred",
+    "prepend",
+    "prev_float",
+    "print",
+    "printf",
+    "private_methods",
+    "product",
+    "protected_methods",
+    "public_method",
+    "public_methods",
+    "public_send",
+    "push",
+    "putc",
+    "puts",
+    "pwrite",
+    "quo",
+    "rassoc",
+    "rationalize",
+    "read",
+    "read_nonblock",
+    "readbyte",
+    "readchar",
+    "readline",
+    "readlines",
+    "readpartial",
+    "real",
+    "real?",
+    "rect",
+    "rectangular",
+    "reduce",
+    "rehash",
+    "reject",
+    "reject!",
+    "remainder",
+    "remove_instance_variable",
+    "reopen",
+    "repeated_combination",
+    "repeated_permutation",
+    "replace",
+    "respond_to?",
+    "reverse",
+    "reverse!",
+    "reverse_each",
+    "rewind",
+    "rindex",
+    "rjust",
+    "rotate",
+    "rotate!",
+    "round",
+    "rpartition",
+    "rstrip",
+    "rstrip!",
+    "ruby2_keywords",
+    "sample",
+    "scan",
+    "scrub",
+    "scrub!",
+    "seek",
+    "select",
+    "select!",
+    "send",
+    "set_backtrace",
+    "set_encoding",
+    "set_encoding_by_bom",
+    "setbyte",
+    "shift",
+    "shuffle",
+    "shuffle!",
+    "singleton_class",
+    "singleton_method",
+    "singleton_method_added",
+    "singleton_methods",
+    "size",
+    "slice",
+    "slice!",
+    "slice_after",
+    "slice_before",
+    "slice_when",
+    "sort",
+    "sort!",
+    "sort_by",
+    "sort_by!",
+    "source_location",
+    "split",
+    "squeeze",
+    "squeeze!",
+    "start_with?",
+    "stat",
+    "step",
+    "store",
+    "strip",
+    "strip!",
+    "sub",
+    "sub!",
+    "succ",
+    "succ!",
+    "sum",
+    "swapcase",
+    "swapcase!",
+    "sync",
+    "sync=",
+    "sysread",
+    "sysseek",
+    "syswrite",
+    "take",
+    "take_while",
+    "tally",
+    "tap",
+    "tell",
+    "then",
+    "timeout",
+    "timeout=",
+    "times",
+    "to_a",
+    "to_ary",
+    "to_c",
+    "to_enum",
+    "to_f",
+    "to_h",
+    "to_hash",
+    "to_i",
+    "to_int",
+    "to_io",
+    "to_path",
+    "to_proc",
+    "to_r",
+    "to_s",
+    "to_set",
+    "to_str",
+    "to_sym",
+    "tr",
+    "tr!",
+    "tr_s",
+    "tr_s!",
+    "transform_keys",
+    "transform_keys!",
+    "transform_values",
+    "transform_values!",
+    "transpose",
+    "truncate",
+    "tty?",
+    "undump",
+    "ungetbyte",
+    "ungetc",
+    "unicode_normalize",
+    "unicode_normalize!",
+    "unicode_normalized?",
+    "union",
+    "uniq",
+    "uniq!",
+    "unpack",
+    "unpack1",
+    "unshift",
+    "upcase",
+    "upcase!",
+    "update",
+    "upto",
+    "valid_encoding?",
+    "value?",
+    "values",
+    "values_at",
+    "wait",
+    "wait_priority",
+    "wait_readable",
+    "wait_writable",
+    "write",
+    "write_nonblock",
+    "yield",
+    "yield_self",
+    "zero?",
+    "zip",
+    "|",
+    "~",
 ];
 
 /// What a receiver denotes, to gather every method called on the same thing: a local or
 /// parameter within its method, an instance variable within its class, a method result
 /// (`Bundler.ui`, a paren-less `ui`) within the class for self-relative chains and repo-wide for
 /// constant-rooted ones.
-fn usage_key(call: &CallSite, scope: &str) -> Option<(String, String)> {
+fn usage_key(call: &CallSite, scope: &str) -> Option<UsageKey> {
     let r = call.receiver.as_deref()?.trim();
     if let Some(TypeExpr::Call(_)) = &call.receiver_type {
         let expr = format!("{:?}", call.receiver_type.as_ref()?);
@@ -874,6 +1377,13 @@ fn usage_key(call: &CallSite, scope: &str) -> Option<(String, String)> {
     }
     let owner = if r.starts_with('@') { scope } else { call.from_symbol_id.as_str() };
     Some((owner.to_string(), r.to_string()))
+}
+
+/// Whether the method a call names is called on its receiver: not for `items.map(&:name)`, which
+/// calls `name` on the elements.
+fn calls_on_receiver(call: &CallSite) -> bool {
+    call.kind != CallKind::SymbolRef
+        || call.via.as_deref().is_some_and(|v| matches!(v, "send" | "public_send" | "__send__" | "method"))
 }
 
 /// A plain local, parameter or instance variable (not an expression).
@@ -1827,6 +2337,8 @@ fn go_implementers(index: &Index, required: &[String], m: &str) -> Vec<SymRef> {
 
 /// (class, method, positional index) of a Ruby parameter.
 type ParamSlot = (String, String, usize);
+/// (owner, variable or expression), as `usage_key` names it
+type UsageKey = (String, String);
 
 /// Ruby classes and modules by qualified name (a class reopened in several files is one class),
 /// their methods, and their ancestors from `<`, `include`, `extend` and `prepend`.
@@ -1847,9 +2359,11 @@ struct RubyModel<'a> {
     responders: HashMap<&'a str, HashSet<&'a str>>,
     /// classes whose instances may answer methods the repo doesn't show
     open: HashSet<String>,
+    /// classes that are, or directly inherit or include, a Ruby built-in: they answer its methods
+    builtin: HashSet<String>,
     /// (calling symbol, receiver variable) -> methods called on it there, and whether it is
     /// guarded by `respond_to?`
-    usage: HashMap<(String, String), (HashSet<&'a str>, bool)>,
+    usage: RefCell<HashMap<UsageKey, (HashSet<&'a str>, bool)>>,
     methods: HashMap<(&'a str, &'a str), Vec<SymRef>>,
     ancestors: HashMap<String, Vec<String>>,
     descendants: HashMap<String, Vec<String>>,
@@ -1911,8 +2425,12 @@ impl<'a> RubyModel<'a> {
                     .min_by_key(|s| s.end_line - s.start_line);
                 let Some(owner) = owner else { continue };
                 let Some(anc) = m.resolve_const(&rel.trait_name, &owner.qualified_name) else {
-                    // an ancestor outside the repo: its methods are unknown
-                    m.open.insert(owner.qualified_name.clone());
+                    if RUBY_BUILTINS.binary_search(&rel.trait_name.trim_start_matches("::")).is_ok() {
+                        m.builtin.insert(owner.qualified_name.clone());
+                    } else {
+                        // an ancestor outside the repo: its methods are unknown
+                        m.open.insert(owner.qualified_name.clone());
+                    }
                     continue;
                 };
                 if anc == owner.qualified_name {
@@ -1923,9 +2441,15 @@ impl<'a> RubyModel<'a> {
             }
             // `class Foo < Struct.new(..)` and other computed superclasses
             for s in f.symbols.iter().filter(|s| s.kind == "class" && s.signature.contains(" < ")) {
-                if !m.ancestors.contains_key(&s.qualified_name) {
+                if !m.ancestors.contains_key(&s.qualified_name) && !m.builtin.contains(&s.qualified_name) {
                     m.open.insert(s.qualified_name.clone());
                 }
+            }
+        }
+        // a reopened built-in answers the runtime's methods too
+        for c in &m.classes {
+            if RUBY_BUILTINS.binary_search(c).is_ok() {
+                m.builtin.insert(c.to_string());
             }
         }
         // `method_missing` answers anything
@@ -1938,11 +2462,11 @@ impl<'a> RubyModel<'a> {
         // the same object in every method of its class, so its usage is gathered class-wide
         for (_, f) in ruby() {
             let scope: HashMap<&str, &str> = f.symbols.iter().map(|s| (s.symbol_id.as_str(), own_scope(s))).collect();
-            for c in &f.calls {
+            for c in f.calls.iter().filter(|c| calls_on_receiver(c)) {
                 let Some(key) = usage_key(c, scope.get(c.from_symbol_id.as_str()).copied().unwrap_or("")) else {
                     continue;
                 };
-                let entry = m.usage.entry(key).or_default();
+                let entry = m.usage.get_mut().entry(key).or_default();
                 if c.target_name == "respond_to?" {
                     entry.1 = true;
                 }
@@ -1952,12 +2476,14 @@ impl<'a> RubyModel<'a> {
         m
     }
 
-    /// Whether instances of `class` answer `method` (core methods and classes with external
-    /// ancestors or `method_missing` answer anything).
+    /// Whether instances of `class` answer `method`: Object's methods, the core API below a
+    /// built-in, anything below an external ancestor or with `method_missing`.
     fn responds(&self, class: &str, method: &str) -> bool {
-        RUBY_CORE_METHODS.contains(&method)
+        RUBY_OBJECT_API.binary_search(&method).is_ok()
             || self.lookup(class, method).is_some()
             || self.walk(class, &self.ancestors, |c| self.open.contains(c).then_some(())).is_some()
+            || (RUBY_CORE_API.binary_search(&method).is_ok()
+                && self.walk(class, &self.ancestors, |c| self.builtin.contains(c).then_some(())).is_some())
     }
 
     /// Whether some instance of `class` or of a class below it answers all of `methods`.
@@ -2115,11 +2641,85 @@ fn infer_ruby_params(index: &Index) {
     }
 }
 
+/// A value passed to a method must answer what the method calls on that parameter: the usage of a
+/// parameter or instance variable passed as an argument gains the callee parameter's usage (calls
+/// with one exact target, to a fixpoint). Whether any usage grew.
+fn infer_ruby_usage(index: &Index) -> bool {
+    let rb = &index.ruby;
+    let ruby = || index.files.iter().enumerate().filter(|(_, f)| f.language == Language::Ruby);
+    let mut scopes: HashMap<&str, &str> = HashMap::new();
+    for (_, f) in ruby() {
+        scopes.extend(f.symbols.iter().map(|s| (s.symbol_id.as_str(), own_scope(s))));
+    }
+    // (class, method, index) -> the usage key of that parameter inside the method
+    let mut param_keys: HashMap<ParamSlot, UsageKey> = HashMap::new();
+    for (_, f) in ruby() {
+        for c in &f.calls {
+            if let Some(TypeExpr::Param(method, i)) = &c.receiver_type
+                && let Some(key) = usage_key(c, "")
+                && let Some(scope) = scopes.get(c.from_symbol_id.as_str())
+            {
+                param_keys.insert((scope.to_string(), method.clone(), *i), key);
+            }
+        }
+    }
+    let arg_key = |scope: &str, arg: &TypeExpr| -> Option<UsageKey> {
+        match arg {
+            TypeExpr::Param(method, i) => param_keys.get(&(scope.to_string(), method.clone(), *i)).cloned(),
+            TypeExpr::Field(base, ivar) if ivar.starts_with('@') && **base == TypeExpr::Named("self".into()) => {
+                Some((scope.to_string(), ivar.clone()))
+            }
+            _ => None,
+        }
+    };
+    let mut grew = false;
+    for _ in 0..4 {
+        let mut adds: Vec<(UsageKey, Vec<&str>)> = Vec::new();
+        for (fi, file) in ruby() {
+            let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
+            for call in file.calls.iter().filter(|c| c.arg_types.iter().any(Option::is_some)) {
+                let Some(&caller) = by_id.get(call.from_symbol_id.as_str()) else { continue };
+                let Some((targets, Tier::Exact)) = resolve_call(index, fi, file, caller, call) else { continue };
+                let [t] = targets.as_slice() else { continue };
+                let target = index.sym(*t);
+                let usage = rb.usage.borrow();
+                for (i, arg) in call.arg_types.iter().enumerate() {
+                    let Some(ak) = arg.as_ref().and_then(|a| arg_key(own_scope(caller), a)) else { continue };
+                    let Some((used, false)) = param_keys
+                        .get(&(scope_of(target).to_string(), target.name.clone(), i))
+                        .and_then(|pk| usage.get(pk))
+                    else {
+                        continue;
+                    };
+                    let have = usage.get(&ak);
+                    let new: Vec<&str> =
+                        used.iter().copied().filter(|m| have.is_none_or(|h| !h.0.contains(m))).collect();
+                    if !new.is_empty() {
+                        adds.push((ak, new));
+                    }
+                }
+            }
+        }
+        if adds.is_empty() {
+            break;
+        }
+        grew = true;
+        let mut usage = rb.usage.borrow_mut();
+        for (k, ms) in adds {
+            usage.entry(k).or_default().0.extend(ms);
+        }
+    }
+    grew
+}
+
 fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
     let mut acc = EdgeAcc { edges: BTreeMap::new() };
     let mut entrypoints = HashSet::new();
     infer_go_params(index);
     infer_ruby_params(index);
+    if infer_ruby_usage(index) {
+        infer_ruby_params(index);
+    }
 
     for (fi, file) in index.files.iter().enumerate() {
         let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
@@ -2446,11 +3046,11 @@ mod tests {
         let mut files = vec![parse_as(
             "app/u.rb",
             Language::Ruby,
-            "class User\n  def go(items, other)\n    items.map(&:name)\n    other.send(:check)\n    send(:audit)\n  end\n  def name; end\n  def check; end\n  def audit; end\nend\n",
+            "class User\n  def go(items, other)\n    items.map(&:label)\n    other.send(:check)\n    send(:audit)\n  end\n  def label; end\n  def check; end\n  def audit; end\nend\n",
         )];
         let edges = link(&mut files);
         let e = |to: &str| calls_between(&edges, &files, ("app/u.rb", "go"), ("app/u.rb", to));
-        assert_eq!(e("name").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
+        assert_eq!(e("label").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
         assert_eq!(e("check").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
         assert_eq!(e("audit").map(|e| e.confidence), Some("STATIC_EXACT"), "receiver-less send stays a self call");
     }
@@ -2812,6 +3412,75 @@ end
         let a = from("a");
         assert_eq!(a.len(), 1, "{a:#?}");
         assert!(a[0].to.contains("::Other::source#") && a[0].confidence == "STATIC_EXACT");
+    }
+
+    #[test]
+    fn ruby_core_names_on_untyped_values_link_only_with_repo_usage() {
+        let src = "class Bag
+  def delete_if; end
+  def weigh; end
+end
+class Tbl
+  def delete_if; end
+end
+class Env
+  def clean(env)
+    env.delete_if { |k| k }
+  end
+  def trim(bag)
+    bag.delete_if { |k| k }
+    bag.weigh
+  end
+  def fill(row)
+    row.push(1)
+    row.label
+  end
+  def ship(x)
+    x.label
+    check(x)
+  end
+  def check(y)
+    y.seal
+  end
+end
+class Pack
+  def label; end
+  def seal; end
+end
+class Tag
+  def label; end
+end
+class Row < Array
+  def label; end
+end
+";
+        let mut files = vec![parse_as("lib/b.rb", Language::Ruby, src)];
+        let edges = link(&mut files);
+        let from = |caller: &str| {
+            edges.iter().filter(|e| e.from == id(&files, caller) && e.kind == "CALLS").collect::<Vec<_>>()
+        };
+        // `env` is only used through core methods: as likely a Hash as a repo class
+        assert!(from("clean").is_empty(), "{:#?}", from("clean"));
+        // `weigh` shows a repo object, and only Bag answers both
+        let trim: Vec<_> = from("trim").into_iter().filter(|e| e.to.contains("::delete_if#")).collect();
+        assert_eq!(trim.len(), 1, "{trim:#?}");
+        assert!(trim[0].to.contains("::Bag::") && trim[0].confidence == "STATIC_EXACT");
+        // `push` is no Object method: only the Array subclass answers it next to `label`
+        let fill = from("fill");
+        assert_eq!(fill.len(), 1, "{fill:#?}");
+        assert!(fill[0].to.contains("::Row::label#") && fill[0].confidence == "STATIC_EXACT");
+        // `x` goes to `check`, which calls `seal` on it: only Pack answers both
+        let ship: Vec<_> = from("ship").into_iter().filter(|e| e.to.contains("::label#")).collect();
+        assert_eq!(ship.len(), 1, "{ship:#?}");
+        assert!(ship[0].to.contains("::Pack::") && ship[0].confidence == "STATIC_EXACT");
+    }
+
+    #[test]
+    fn ruby_core_api_is_sorted_for_binary_search() {
+        assert!(RUBY_CORE_API.windows(2).all(|w| w[0] < w[1]));
+        assert!(RUBY_OBJECT_API.windows(2).all(|w| w[0] < w[1]));
+        assert!(RUBY_BUILTINS.windows(2).all(|w| w[0] < w[1]));
+        assert!(RUBY_OBJECT_API.iter().all(|m| RUBY_CORE_API.binary_search(m).is_ok()));
     }
 
     #[test]
