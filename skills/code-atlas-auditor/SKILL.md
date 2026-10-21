@@ -1,24 +1,28 @@
 ---
 name: code-atlas-auditor
-description: Audit a codebase for security vulnerabilities and impactful correctness bugs using the code-atlas MCP server (the Auditor role), then write the findings to AUDIT.md with CVSS 3.1 scores. Re-syncs and maps any missing or stale part of the atlas before trusting it, generates candidates from the atlas's audit queries, taint paths and semantic search, verifies each one against the source (and with an isolated proof of concept when possible), and rejects what a caller's guard already stops. Use this whenever the user asks to audit, pentest, security-review or bug-hunt a repository, or asks whether a feature, endpoint or change is safe, and code-atlas tools (get_macro_atlas, query_audit_surface, trace_connective_paths, inspect_symbol_zoom) are available, even if they never mention the atlas.
+description: Audit a codebase for security vulnerabilities and impactful correctness bugs by reading the source directly and using the code-atlas MCP server (the Auditor role) as a lens on how the code connects — its callers and the data they pass, its callees' assumptions, the flows and entrypoints that reach it — then write the findings to AUDIT.md with CVSS 3.1 scores. Re-syncs and maps any missing or stale part of the atlas before trusting it, follows connectivity from leads into the source, verifies every candidate against the code (and with an isolated proof of concept when possible), and rejects what a caller's guard already stops. Use this whenever the user asks to audit, pentest, security-review or bug-hunt a repository, or asks whether a feature, endpoint or change is safe, and code-atlas tools (get_macro_atlas, query_audit_surface, trace_connective_paths, inspect_symbol_zoom) are available, even if they never mention the atlas.
 ---
 
 # Code Atlas Auditor
 
-A Cartographer has built a model of this codebase in code-atlas. It records:
-- what each function does and what it assumes;
-- which calls carry attacker-controlled data;
-- how requests flow from entrypoints to sinks.
+**You audit by reading the source. The atlas is your lens on how the code in front of you connects to the rest of the system.**
 
-Your job is to turn that model into **verified** findings: real vulnerabilities and correctness bugs with real impact, each proven against the source, scored with CVSS 3.1, and written to `AUDIT.md`.
+Read the actual functions. When you are looking at one, a function alone rarely tells you whether it is dangerous: `run_export(path)` is fine if `path` is a constant and a hole if it comes off a request. The atlas answers exactly the questions the source in front of you leaves open:
+- **Who reaches this, and with what?** Its callers, the data each passes, and whether that data is attacker-controlled (taint).
+- **What does it rely on?** Its callees' contracts — what they assume but do not check.
+- **Where does it sit?** Which execution flows and entrypoints reach it, so you know who can trigger it and with what privilege.
+
+So the loop is: read code → ask the atlas how it wires in → follow a real caller or callee to the next piece of source → repeat. A Cartographer built the model (intent, assumptions, taint-marked edges, flows); it is a map of the territory, not the territory. The source is ground truth.
+
+Your job is **verified** findings: real vulnerabilities and correctness bugs with real impact, each traced through source you read, scored with CVSS 3.1, and written to `AUDIT.md`.
 
 Three things decide whether an audit is worth reading:
 
-- **Only verified findings.** The atlas holds hypotheses (`audit_smells`, risk scores) written by another agent, and they can be wrong or stale. A finding is reported only after you have read the code path yourself. Prefer a proof of concept that ran over one you reasoned about.
+- **Only verified findings.** The atlas holds hypotheses (`audit_smells`, risk scores, even edge directions) written by another agent, and they can be wrong or stale. Nothing is a finding until you have read the path in the source yourself. Prefer a proof of concept that ran over one you reasoned about.
 - **No false alarms.** A suspicious sink that a caller's check already guards is not a finding. Reporting it costs the reader time and their trust in everything else on the list. Record it under "Rejected candidates" with the reason instead.
-- **Freshness first.** Auditing a stale model audits code that no longer exists. The most dangerous bugs are often exactly the recent change the model hasn't seen.
+- **Freshness first.** The atlas can lag the code. When an atlas claim and the source disagree, the source wins — and the gap itself is a lead, because the most dangerous bug is often the recent change the model hasn't seen.
 
-Read `references/hunting.md` before you generate candidates: query recipes, a bug-class checklist and the proof-of-concept rules. Read `references/report.md` before you write: the `AUDIT.md` template and how to choose CVSS vectors. `scripts/cvss.py` computes scores; never compute them by hand.
+Read `references/hunting.md` before you hunt: the connectivity queries, a bug-class checklist and the proof-of-concept rules. Read `references/report.md` before you write: the `AUDIT.md` template and how to choose CVSS vectors. `scripts/cvss.py` computes scores; never compute them by hand.
 
 ## 0. Preconditions and scope
 
@@ -57,44 +61,41 @@ From `get_macro_atlas`, list the entrypoints, recorded flows and module rollups.
 - what it accepts;
 - the sinks its flow reaches.
 
-Rollups' `known_architectural_risks` and flows' `critical_assumptions_at_step` are good seeds for candidates.
+Rollups' `known_architectural_risks` and flows' `critical_assumptions_at_step` are good places to start reading.
 
-## 3. Generate candidates
+## 3. Pick where to start reading
 
-Work through these, in roughly this order. `references/hunting.md` explains what each one returns.
+You read the source; the atlas points you at the source worth reading first. Build a reading list of symbols and files from:
 
-1. `query_audit_surface` in each mode, scoped as needed:
-   - `HIGH_RISK_CONTRACTS`
-   - `TRUST_BOUNDARY_TO_SINK_PATHS`
-   - `UNCHECKED_ASSUMPTION_HOTSPOTS`
-   - `AMBIGUOUS_UNVERIFIED_EDGES`
+1. `query_audit_surface`, scoped as needed, in each mode (`references/hunting.md` says what each returns):
+   - `HIGH_RISK_CONTRACTS` — the Cartographer's worst cases.
+   - `TRUST_BOUNDARY_TO_SINK_PATHS` — request data reaching a sink.
+   - `UNCHECKED_ASSUMPTION_HOTSPOTS` — a callee assumes what its caller may not enforce.
+   - `AMBIGUOUS_UNVERIFIED_EDGES` — unresolved edges; blind spots in the taint paths, not findings.
+2. `trace_connective_paths` from each entrypoint to each sink it might reach (`TAINT`, then `SHORTEST`; taint edges are sparse, so a missing taint path is not proof of safety).
+3. `semantic_atlas_search` by bug-class vocabulary: "where are refunds authorised?", "where is the redirect target validated?", "where is user input put into a shell command?".
+4. The stale or newly mapped symbols from step 1, the money/permission/data-deletion flows, and anything the user named.
 
-   Unverified edges are blind spots in the taint paths, not findings.
-2. `trace_connective_paths` from each entrypoint to each sensitive sink it might reach, in `TAINT` mode, then in `SHORTEST` mode. Taint edges are sparse, so a missing taint path is not proof of safety.
-3. `semantic_atlas_search` for each bug class relevant to the system, using its vocabulary. For example: "where are refunds authorised?", "where is the redirect target validated?", "where is user input put into a shell command?".
-4. The stale or newly mapped symbols from step 1, and anything the user specifically asked about.
-5. Correctness: the flows that move money, change permissions or delete data. Check their `state_mutations` and `error_surface` for:
-   - partial failure;
-   - double application;
-   - lost updates;
-   - crashes on the main path.
+These are leads — symbols to open, not findings. Keep the list; then read.
 
-Keep a candidate list: symbol, suspected issue, and why.
+## 4. Read the source, using the atlas to connect it
 
-## 4. Verify every candidate against the source
+This is the core loop. Take a lead, open the actual code, and use the atlas to see how it wires into the system — then follow a real edge to the next piece of source.
 
-For each candidate:
+For each symbol you are reading:
 
-1. **Read the code.** `inspect_symbol_zoom` (with source) shows the contract, the callers and their edge semantics, the callees and their assumptions, and the reachable entrypoints. For long or stateful functions, `expand_function_cfg` shows the branches, error exits and loops. Read the file itself when you need more.
-2. **Reachability.** Find a real path from an entrypoint. A dangerous function nothing calls is at most a latent issue.
-3. **Attacker control.** Check whether the attacker controls the value that reaches the sink, or a guard, type conversion or constant in between makes it safe. Check every caller, not just one.
-4. **Guards.** Find what the existing checks actually enforce, and what bypasses them: missing keys, `None`, alternative encodings, `//host`, case, type confusion.
-5. **Decide.**
-   - **A finding**: reachable, controllable, not guarded.
-   - **A rejected candidate**: say why it is safe, in one line.
-   - **Unverifiable**: say what you'd need.
+1. **Read its source**, from the repo or from `inspect_symbol_zoom` (with source). For long or stateful functions, `expand_function_cfg` shows the branches, error exits and loops. What does this code *do* with its inputs, and what does it assume about them?
+2. **Connect it upward — who reaches this, with what?** `inspect_symbol_zoom` lists the callers, each edge's semantics, and whether it carries taint. For a value that worries you, walk to each caller's source (every one, not just the first) and see where that value comes from. A sink is only a finding if some real caller feeds it attacker-controlled data past every guard.
+3. **Connect it downward — what does it rely on?** The callees' contracts show what they assume but don't check. When this function fails to guarantee what a callee assumes, that mismatch is the bug; open the callee's source to confirm the assumption is real and unmet.
+4. **Place it — who can trigger it?** The flows and reachable entrypoints the zoom lists tell you the attacker's position (anonymous, logged-in, admin, webhook) — which decides reachability and later the CVSS vector.
+5. **Trust the source over the atlas.** If the code does not match the contract, believe the code, note the discrepancy for the report's "Atlas notes", and keep going.
 
-A chain counts as one finding with its full path, scored by the end-to-end impact. One example: a guard bypass in `require_admin` that exposes command injection in an admin-only function.
+Then **decide**:
+- **A finding**: you traced a real path, in source, from an entrypoint to an impact, past every guard.
+- **A rejected candidate**: a guard, type conversion or constant makes it safe. One line saying which.
+- **Unverifiable**: say what you'd need.
+
+A chain is one finding with its full path, scored end to end — e.g. a guard bypass in `require_admin` opening command execution in an admin-only function. Follow edges outward from each lead until the paths close; new leads you discover by reading (a caller that looks unguarded, a callee misused) go on the list.
 
 ## 5. Confirm with a proof of concept when you can
 

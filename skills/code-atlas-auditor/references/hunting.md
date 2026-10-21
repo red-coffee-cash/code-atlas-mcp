@@ -10,7 +10,7 @@ Contents:
 
 ## Queries
 
-All take `scope_path_prefix`. Copy symbol ids exactly from tool output.
+These point you at source worth reading and show how the code you are reading connects; they do not replace reading it. `inspect_symbol_zoom` is the bridge you will use most — given a symbol you have open, it shows its callers, callees, flows and reachability in one call. All take `scope_path_prefix`. Copy symbol ids exactly from tool output.
 
 | Call | Returns | Use it for |
 |---|---|---|
