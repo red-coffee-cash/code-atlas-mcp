@@ -573,11 +573,7 @@ fn resolve_ruby(
             // Structural typing from usage: everything this method calls on the same variable
             // must be answered by its class (or no program run reaches the calls without a
             // NoMethodError). Not applied when guarded by `respond_to?`.
-            let usage_key = |r: &str| {
-                let r = r.trim();
-                ((if r.starts_with('@') { scope } else { call.from_symbol_id.as_str() }).to_string(), r.to_string())
-            };
-            if let Some((used, false)) = call.receiver.as_deref().and_then(|r| rb.usage.get(&usage_key(r)))
+            if let Some((used, false)) = usage_key(call, scope).and_then(|k| rb.usage.get(&k))
                 && used.len() > 1
             {
                 // no repo class answers them all: the value is an object from outside the repo
@@ -858,6 +854,27 @@ const RUBY_CORE_METHODS: &[&str] = &[
     "print",
     "call",
 ];
+
+/// What a receiver denotes, to gather every method called on the same thing: a local or
+/// parameter within its method, an instance variable within its class, a method result
+/// (`Bundler.ui`, a paren-less `ui`) within the class for self-relative chains and repo-wide for
+/// constant-rooted ones.
+fn usage_key(call: &CallSite, scope: &str) -> Option<(String, String)> {
+    let r = call.receiver.as_deref()?.trim();
+    if let Some(TypeExpr::Call(_)) = &call.receiver_type {
+        let expr = format!("{:?}", call.receiver_type.as_ref()?);
+        if expr.contains("Param(") {
+            return None; // depends on the method's own parameter
+        }
+        let owner = if expr.contains("Named(\"self") { scope } else { "" };
+        return Some((owner.to_string(), expr));
+    }
+    if !is_simple_var(r) {
+        return None;
+    }
+    let owner = if r.starts_with('@') { scope } else { call.from_symbol_id.as_str() };
+    Some((owner.to_string(), r.to_string()))
+}
 
 /// A plain local, parameter or instance variable (not an expression).
 fn is_simple_var(r: &str) -> bool {
@@ -1922,16 +1939,10 @@ impl<'a> RubyModel<'a> {
         for (_, f) in ruby() {
             let scope: HashMap<&str, &str> = f.symbols.iter().map(|s| (s.symbol_id.as_str(), own_scope(s))).collect();
             for c in &f.calls {
-                let Some(r) = c.receiver.as_deref().map(str::trim) else { continue };
-                if !is_simple_var(r) {
+                let Some(key) = usage_key(c, scope.get(c.from_symbol_id.as_str()).copied().unwrap_or("")) else {
                     continue;
-                }
-                let owner = if r.starts_with('@') {
-                    scope.get(c.from_symbol_id.as_str()).copied().unwrap_or("")
-                } else {
-                    c.from_symbol_id.as_str()
                 };
-                let entry = m.usage.entry((owner.to_string(), r.to_string())).or_default();
+                let entry = m.usage.entry(key).or_default();
                 if c.target_name == "respond_to?" {
                     entry.1 = true;
                 }
@@ -2764,6 +2775,20 @@ class Set2
     r.code()
   end
 end
+class Holder
+  def initialize(o)
+    @cfg = o[:cfg]
+  end
+  def cfg
+    @cfg
+  end
+  def a
+    cfg.source()
+  end
+  def b
+    cfg.extra()
+  end
+end
 ";
         let mut files = vec![parse_as("lib/s.rb", Language::Ruby, src)];
         let edges = link(&mut files);
@@ -2783,6 +2808,10 @@ end
         assert!(guess.iter().all(|e| e.to.contains("::Other::")), "{guess:#?}");
         // no repo class answers source and code: `r` is an outside object
         assert!(from("outside").is_empty(), "{:#?}", from("outside"));
+        // every use of the `cfg` result in Holder needs source and extra: only Other
+        let a = from("a");
+        assert_eq!(a.len(), 1, "{a:#?}");
+        assert!(a[0].to.contains("::Other::source#") && a[0].confidence == "STATIC_EXACT");
     }
 
     #[test]
