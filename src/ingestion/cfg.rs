@@ -22,21 +22,30 @@ const COND_MAX: usize = 60;
 pub enum Stmt<'t> {
     Simple,
     Block(Node<'t>),
+    /// `init` runs before the condition (Go `if x := f(); x > 0`); `then: None` is an empty branch
+    /// (Ruby `unless` without `else` only acts on the FALSE edge).
     If {
+        init: Option<Node<'t>>,
         cond: Node<'t>,
-        then: Node<'t>,
+        then: Option<Node<'t>>,
         otherwise: Option<Node<'t>>,
     },
-    /// `cond` is the loop condition or iterator; `None` for an unconditional loop.
+    /// `cond` is the loop condition or iterator; `None` for an unconditional loop. `init` runs once
+    /// before the loop and `update` after each iteration, `continue` included (C-style `for`).
     Loop {
+        init: Option<Node<'t>>,
         cond: Option<Node<'t>>,
+        update: Option<Node<'t>>,
         body: Node<'t>,
     },
-    /// `breakable`: a `break` inside an arm leaves the match (C-style switch).
+    /// `breakable`: a `break` inside an arm leaves the match (C-style switch). Without
+    /// `has_default`, control can skip every arm.
     Match {
+        init: Option<Node<'t>>,
         scrutinee: Option<Node<'t>>,
         arms: Vec<(String, Node<'t>)>,
         breakable: bool,
+        has_default: bool,
     },
     /// try/except/finally. Handlers are reachable from the start of the try body.
     Try {
@@ -257,14 +266,22 @@ impl<'a> Builder<'a> {
                 let children = self.lang.statements(b);
                 self.seq(children, Some(cur))
             }
-            Stmt::If { cond, then, otherwise } => {
+            Stmt::If { init, cond, then, otherwise } => {
+                if let Some(i) = init {
+                    self.absorb(cur, i);
+                }
                 self.absorb(cur, cond);
                 let label = clip(text(cond, self.src));
                 let join = self.new_block(BlockKind::Join);
-                let t = self.new_block(BlockKind::Normal);
-                self.edge(cur, t, format!("TRUE_BRANCH({label})"));
-                if let Some(end) = self.lower(then, t) {
-                    self.edge(end, join, "NEXT");
+                match then {
+                    Some(then) => {
+                        let t = self.new_block(BlockKind::Normal);
+                        self.edge(cur, t, format!("TRUE_BRANCH({label})"));
+                        if let Some(end) = self.lower(then, t) {
+                            self.edge(end, join, "NEXT");
+                        }
+                    }
+                    None => self.edge(cur, join, format!("TRUE_BRANCH({label})")),
                 }
                 match otherwise {
                     Some(o) => {
@@ -278,7 +295,10 @@ impl<'a> Builder<'a> {
                 }
                 self.has_incoming(join).then_some(join)
             }
-            Stmt::Loop { cond, body } => {
+            Stmt::Loop { init, cond, update, body } => {
+                if let Some(i) = init {
+                    self.absorb(cur, i);
+                }
                 let header = self.new_block(BlockKind::LoopHeader);
                 self.edge(cur, header, "NEXT");
                 if let Some(c) = cond {
@@ -294,15 +314,29 @@ impl<'a> Builder<'a> {
                     }
                     None => self.edge(header, body_block, "NEXT"),
                 }
-                self.loops.push((header, after, false));
+                // With an update clause, the body's end and every `continue` go through a latch block
+                // that runs it before looping back.
+                let latch = update.map(|u| {
+                    let l = self.new_block(BlockKind::Normal);
+                    self.absorb(l, u);
+                    self.edge(l, header, "LOOP_BACKEDGE");
+                    l
+                });
+                self.loops.push((latch.unwrap_or(header), after, false));
                 let end = self.lower(body, body_block);
                 self.loops.pop();
                 if let Some(e) = end {
-                    self.edge(e, header, "LOOP_BACKEDGE");
+                    match latch {
+                        Some(l) => self.edge(e, l, "NEXT"),
+                        None => self.edge(e, header, "LOOP_BACKEDGE"),
+                    }
                 }
                 self.has_incoming(after).then_some(after)
             }
-            Stmt::Match { scrutinee, arms, breakable } => {
+            Stmt::Match { init, scrutinee, arms, breakable, has_default } => {
+                if let Some(i) = init {
+                    self.absorb(cur, i);
+                }
                 if let Some(s) = scrutinee {
                     self.absorb(cur, s);
                 }
@@ -319,6 +353,9 @@ impl<'a> Builder<'a> {
                 }
                 if breakable {
                     self.loops.pop();
+                }
+                if !has_default {
+                    self.edge(cur, join, "NO_MATCH");
                 }
                 self.has_incoming(join).then_some(join)
             }
@@ -557,18 +594,18 @@ impl CfgLang for RustCfg {
                 };
                 let otherwise =
                     node.child_by_field_name("alternative").and_then(|alt| named_children(alt).into_iter().next());
-                Stmt::If { cond, then, otherwise }
+                Stmt::If { init: None, cond, then: Some(then), otherwise }
             }
             "while_expression" => match (node.child_by_field_name("condition"), node.child_by_field_name("body")) {
-                (cond, Some(body)) => Stmt::Loop { cond, body },
+                (cond, Some(body)) => Stmt::Loop { init: None, update: None, cond, body },
                 _ => Stmt::Simple,
             },
             "for_expression" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("value"), body },
+                Some(body) => Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("value"), body },
                 None => Stmt::Simple,
             },
             "loop_expression" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: None, body },
+                Some(body) => Stmt::Loop { init: None, update: None, cond: None, body },
                 None => Stmt::Simple,
             },
             "match_expression" => {
@@ -587,7 +624,13 @@ impl CfgLang for RustCfg {
                             .collect()
                     })
                     .unwrap_or_default();
-                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms, breakable: false }
+                Stmt::Match {
+                    init: None,
+                    has_default: true,
+                    scrutinee: node.child_by_field_name("value"),
+                    arms,
+                    breakable: false,
+                }
             }
             "return_expression" => Stmt::Return,
             "break_expression" => Stmt::Break,
@@ -676,9 +719,12 @@ impl CfgLang for PythonCfg {
         match node.kind() {
             "block" => Stmt::Block(node),
             "if_statement" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
-                (Some(cond), Some(then)) => {
-                    Stmt::If { cond, then, otherwise: field_children(node, "alternative").into_iter().next() }
-                }
+                (Some(cond), Some(then)) => Stmt::If {
+                    init: None,
+                    cond,
+                    then: Some(then),
+                    otherwise: field_children(node, "alternative").into_iter().next(),
+                },
                 _ => Stmt::Simple,
             },
             "elif_clause" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
@@ -688,8 +734,9 @@ impl CfgLang for PythonCfg {
                         next = next.and_then(|n| n.next_named_sibling());
                     }
                     Stmt::If {
+                        init: None,
                         cond,
-                        then,
+                        then: Some(then),
                         otherwise: next.filter(|n| matches!(n.kind(), "elif_clause" | "else_clause")),
                     }
                 }
@@ -703,11 +750,13 @@ impl CfgLang for PythonCfg {
                 None => Stmt::Simple,
             },
             "while_statement" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("condition"), body },
+                Some(body) => {
+                    Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("condition"), body }
+                }
                 None => Stmt::Simple,
             },
             "for_statement" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("right"), body },
+                Some(body) => Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("right"), body },
                 None => Stmt::Simple,
             },
             "try_statement" => {
@@ -734,7 +783,7 @@ impl CfgLang for PythonCfg {
                 Stmt::Try { body, handlers, orelse, finalizer }
             }
             "match_statement" => {
-                let arms = node
+                let arms: Vec<(String, Node)> = node
                     .child_by_field_name("body")
                     .map(|b| {
                         named_children(b)
@@ -752,7 +801,14 @@ impl CfgLang for PythonCfg {
                             .collect()
                     })
                     .unwrap_or_default();
-                Stmt::Match { scrutinee: node.child_by_field_name("subject"), arms, breakable: false }
+                let has_default = arms.iter().any(|(p, _)| p.trim() == "_");
+                Stmt::Match {
+                    init: None,
+                    has_default,
+                    scrutinee: node.child_by_field_name("subject"),
+                    arms,
+                    breakable: false,
+                }
             }
             "with_statement" => match node.child_by_field_name("body") {
                 Some(b) => Stmt::Block(b),
@@ -817,8 +873,9 @@ impl CfgLang for TypeScriptCfg {
             }
             "if_statement" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
                 (Some(cond), Some(then)) => Stmt::If {
+                    init: None,
                     cond,
-                    then,
+                    then: Some(then),
                     otherwise: node
                         .child_by_field_name("alternative")
                         .and_then(|alt| named_children(alt).into_iter().next()),
@@ -826,15 +883,19 @@ impl CfgLang for TypeScriptCfg {
                 _ => Stmt::Simple,
             },
             "while_statement" | "do_statement" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("condition"), body },
+                Some(body) => {
+                    Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("condition"), body }
+                }
                 None => Stmt::Simple,
             },
             "for_in_statement" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("right"), body },
+                Some(body) => Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("right"), body },
                 None => Stmt::Simple,
             },
             "for_statement" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("condition"), body },
+                Some(body) => {
+                    Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("condition"), body }
+                }
                 None => Stmt::Simple,
             },
             "switch_statement" => {
@@ -853,7 +914,16 @@ impl CfgLang for TypeScriptCfg {
                             .collect()
                     })
                     .unwrap_or_default();
-                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms, breakable: true }
+                let has_default = node
+                    .child_by_field_name("body")
+                    .is_some_and(|b| named_children(b).iter().any(|c| c.kind() == "switch_default"));
+                Stmt::Match {
+                    init: None,
+                    has_default,
+                    scrutinee: node.child_by_field_name("value"),
+                    arms,
+                    breakable: true,
+                }
             }
             "try_statement" => {
                 let Some(body) = node.child_by_field_name("body") else { return Stmt::Simple };
@@ -967,23 +1037,57 @@ impl CfgLang for GoCfg {
         match node.kind() {
             "block" | "statement_list" => Stmt::Block(node),
             "if_statement" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
-                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: node.child_by_field_name("alternative") },
+                (Some(cond), Some(then)) => Stmt::If {
+                    init: node.child_by_field_name("initializer"),
+                    cond,
+                    then: Some(then),
+                    otherwise: node.child_by_field_name("alternative"),
+                },
                 _ => Stmt::Simple,
             },
             "for_statement" => match node.child_by_field_name("body") {
                 Some(body) => {
                     let clause =
                         named_children(node).into_iter().find(|c| matches!(c.kind(), "for_clause" | "range_clause"));
-                    let cond = clause
-                        .and_then(|c| c.child_by_field_name("condition").or_else(|| c.child_by_field_name("right")));
-                    Stmt::Loop { cond: cond.or_else(|| node.child_by_field_name("condition")), body }
+                    match clause {
+                        // `for k, v := range xs`: the whole clause is the iterator, so `k, v` count as written
+                        Some(c) if c.kind() == "range_clause" => {
+                            Stmt::Loop { init: None, cond: Some(c), update: None, body }
+                        }
+                        Some(c) => Stmt::Loop {
+                            init: c.child_by_field_name("initializer"),
+                            cond: c.child_by_field_name("condition"),
+                            update: c.child_by_field_name("update"),
+                            body,
+                        },
+                        // `for cond {}` / `for {}`
+                        None => Stmt::Loop {
+                            init: None,
+                            cond: named_children(node)
+                                .into_iter()
+                                .find(|c| c.id() != body.id() && c.kind() != "comment"),
+                            update: None,
+                            body,
+                        },
+                    }
                 }
                 None => Stmt::Simple,
             },
             "expression_switch_statement" | "type_switch_statement" => {
-                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms: arms(node), breakable: true }
+                let arms = arms(node);
+                let has_default = arms.iter().any(|(p, _)| p == "default");
+                Stmt::Match {
+                    init: node.child_by_field_name("initializer"),
+                    scrutinee: node.child_by_field_name("value"),
+                    arms,
+                    breakable: true,
+                    has_default,
+                }
             }
-            "select_statement" => Stmt::Match { scrutinee: None, arms: arms(node), breakable: true },
+            // `select` blocks until one of its cases fires
+            "select_statement" => {
+                Stmt::Match { init: None, has_default: true, scrutinee: None, arms: arms(node), breakable: true }
+            }
             "return_statement" => Stmt::Return,
             "break_statement" => Stmt::Break,
             "continue_statement" => Stmt::Continue,
@@ -999,7 +1103,7 @@ impl CfgLang for GoCfg {
     fn mutated(&self, node: Node, src: &[u8], out: &mut Vec<String>) {
         crate::ingestion::parser::walk(node, |n| {
             let targets: Vec<Node> = match n.kind() {
-                "short_var_declaration" | "assignment_statement" => {
+                "short_var_declaration" | "assignment_statement" | "range_clause" => {
                     n.child_by_field_name("left").map(named_children).unwrap_or_default()
                 }
                 "inc_statement" | "dec_statement" => n.named_child(0).into_iter().collect(),
@@ -1059,11 +1163,10 @@ impl CfgLang for RubyCfg {
     }
 
     fn classify<'t>(&self, node: Node<'t>, src: &[u8]) -> Stmt<'t> {
-        // `unless` runs its branch when the condition is false; a no-op `then` (the condition itself,
-        // already absorbed) puts the branch on the FALSE edge.
+        // `unless` runs its branch when the condition is false: it sits on the FALSE edge, and the
+        // TRUE edge goes to the `else` (or straight to the join).
         let unless = |cond: Node<'t>, body: Option<Node<'t>>, other: Option<Node<'t>>| match (body, other) {
-            (Some(b), Some(o)) => Stmt::If { cond, then: o, otherwise: Some(b) },
-            (Some(b), None) => Stmt::If { cond, then: cond, otherwise: Some(b) },
+            (Some(b), o) => Stmt::If { init: None, cond, then: o, otherwise: Some(b) },
             _ => Stmt::Simple,
         };
         match node.kind() {
@@ -1088,7 +1191,9 @@ impl CfgLang for RubyCfg {
                 Stmt::Try { body: node, handlers, orelse, finalizer }
             }
             "if" | "elsif" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
-                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: node.child_by_field_name("alternative") },
+                (Some(cond), Some(then)) => {
+                    Stmt::If { init: None, cond, then: Some(then), otherwise: node.child_by_field_name("alternative") }
+                }
                 _ => Stmt::Simple,
             },
             "unless" => match node.child_by_field_name("condition") {
@@ -1098,7 +1203,7 @@ impl CfgLang for RubyCfg {
                 None => Stmt::Simple,
             },
             "if_modifier" => match (node.child_by_field_name("condition"), node.child_by_field_name("body")) {
-                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: None },
+                (Some(cond), Some(then)) => Stmt::If { init: None, cond, then: Some(then), otherwise: None },
                 _ => Stmt::Simple,
             },
             "unless_modifier" => match node.child_by_field_name("condition") {
@@ -1107,16 +1212,16 @@ impl CfgLang for RubyCfg {
             },
             "while" | "until" | "while_modifier" | "until_modifier" => {
                 match (node.child_by_field_name("condition"), node.child_by_field_name("body")) {
-                    (cond, Some(body)) => Stmt::Loop { cond, body },
+                    (cond, Some(body)) => Stmt::Loop { init: None, update: None, cond, body },
                     _ => Stmt::Simple,
                 }
             }
             "for" => match node.child_by_field_name("body") {
-                Some(body) => Stmt::Loop { cond: node.child_by_field_name("value"), body },
+                Some(body) => Stmt::Loop { init: None, update: None, cond: node.child_by_field_name("value"), body },
                 None => Stmt::Simple,
             },
             "case" | "case_match" => {
-                let arms = named_children(node)
+                let arms: Vec<(String, Node)> = named_children(node)
                     .into_iter()
                     .filter(|c| matches!(c.kind(), "when" | "in_clause" | "else"))
                     .map(|c| {
@@ -1136,14 +1241,21 @@ impl CfgLang for RubyCfg {
                         (pattern, body)
                     })
                     .collect();
-                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms, breakable: false }
+                let has_default = arms.iter().any(|(p, _)| p == "else");
+                Stmt::Match {
+                    init: None,
+                    has_default,
+                    scrutinee: node.child_by_field_name("value"),
+                    arms,
+                    breakable: false,
+                }
             }
             "call" if node.child_by_field_name("receiver").is_none() => {
                 let method = node.child_by_field_name("method").map_or("", |m| text(m, src));
                 match method {
                     "raise" | "fail" => Stmt::Panic,
                     "loop" => match node.child_by_field_name("block").and_then(|b| b.child_by_field_name("body")) {
-                        Some(body) => Stmt::Loop { cond: None, body },
+                        Some(body) => Stmt::Loop { init: None, update: None, cond: None, body },
                         None => Stmt::Simple,
                     },
                     _ => Stmt::Simple,
@@ -1561,5 +1673,57 @@ mod tests {
             c.blocks.iter().map(|b| &b.mutated).collect::<Vec<_>>()
         );
         assert!(has(&c, "EXCEPTION(StandardError)") && has(&c, "PANIC_OR_THROW"));
+    }
+
+    #[test]
+    fn code_after_a_switch_without_default_stays_reachable() {
+        let reachable = |c: &Cfg, call: &str| {
+            let b = c.blocks.iter().find(|b| b.calls.contains(&call.to_string()));
+            b.is_some_and(|b| c.edges.iter().any(|e| e.to == b.id))
+        };
+        let g = go(
+            "package p\nfunc f(x int) int {\n\tswitch x {\n\tcase 1:\n\t\treturn 2\n\t}\n\tafter()\n\treturn 3\n}\n",
+            "f",
+        );
+        assert!(has(&g, "NO_MATCH") && reachable(&g, "after"), "{:?}", labels(&g));
+        let r = rb("def f(x)\n  case x\n  when 1 then return 1\n  end\n  after()\nend\n", "f");
+        assert!(has(&r, "NO_MATCH") && reachable(&r, "after"), "{:?}", labels(&r));
+        let t = ts("function f(x: number) {\n  switch (x) {\n    case 1: return 2;\n  }\n  after();\n}\n", "f");
+        assert!(has(&t, "NO_MATCH") && reachable(&t, "after"), "{:?}", labels(&t));
+        // a default arm makes the match exhaustive
+        let d = go("package p\nfunc f(x int) {\n\tswitch x {\n\tcase 1:\n\tdefault:\n\t}\n}\n", "f");
+        assert!(!has(&d, "NO_MATCH"), "{:?}", labels(&d));
+    }
+
+    #[test]
+    fn go_initializers_updates_and_range_variables_are_absorbed() {
+        let c =
+            go("package p\nfunc f() int {\n\tif err := load(); err != nil {\n\t\treturn 1\n\t}\n\treturn 0\n}\n", "f");
+        assert!(c.blocks[0].calls.contains(&"load".to_string()), "{:?}", c.blocks[0].calls);
+        assert!(c.blocks[0].mutated.contains(&"err".to_string()), "{:?}", c.blocks[0].mutated);
+
+        let l = go(
+            "package p\nfunc f(n int) {\n\tfor i := start(); i < n; i = next(i) {\n\t\tif i == 3 {\n\t\t\tcontinue\n\t\t}\n\t\twork(i)\n\t}\n}\n",
+            "f",
+        );
+        assert!(l.blocks[0].calls.contains(&"start".to_string()) && l.blocks[0].mutated.contains(&"i".to_string()));
+        let latch = l.blocks.iter().find(|b| b.calls.contains(&"next".to_string())).expect("update block");
+        assert!(latch.mutated.contains(&"i".to_string()));
+        // both the body's end and `continue` run the update before looping back
+        assert!(l.edges.iter().filter(|e| e.to == latch.id).count() >= 2, "{:?}", labels(&l));
+
+        let r = go("package p\nfunc f(xs []int) {\n\tfor k, v := range xs {\n\t\tuse(k, v)\n\t}\n}\n", "f");
+        assert!(has(&r, "TRUE_BRANCH(k, v := range xs)"), "{:?}", labels(&r));
+        let header = r.blocks.iter().find(|b| b.kind == BlockKind::LoopHeader).unwrap();
+        assert_eq!(header.mutated, ["k", "v"]);
+    }
+
+    #[test]
+    fn ruby_unless_without_else_absorbs_its_condition_once() {
+        let c = rb("def f\n  work() unless ready?()\nend\n", "f");
+        assert!(has(&c, "TRUE_BRANCH(ready?())") && has(&c, "FALSE_BRANCH(ready?())"), "{:?}", labels(&c));
+        let with_cond = c.blocks.iter().filter(|b| b.calls.contains(&"ready?".to_string())).count();
+        assert_eq!(with_cond, 1);
+        assert!(c.blocks.iter().any(|b| b.calls == ["work"]));
     }
 }
