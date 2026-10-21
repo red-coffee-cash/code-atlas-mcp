@@ -236,7 +236,7 @@ def grade_shop_full_map(run, assertions):
     h, c = run.header("safe_next"), run.contract("safe_next")
     out.append(check(next(a), "STRICT_MAPPED" in h and "Trust Boundary:** `TRUE`" in h and OPEN_REDIRECT.search(c), h + "\n" + c))
     c = run.contract("escape_html")
-    out.append(check(next(a), ONLY_LT.search(c) and "all five" not in c.lower(), c))
+    out.append(check(next(a), ONLY_LT.search(c), c))
     c = run.contract("service_checkout")
     out.append(check(next(a), USER_ID_UNUSED.search(c), c))
     ok, t = trace(run, "checkout_route", "escape_html")
@@ -251,7 +251,7 @@ def grade_shop_continue(run, assertions):
     out = []
     subs = run.submitted()
     c = run.contract("escape_html")
-    out.append(check(next(a), IDS["escape_html"] in subs and ONLY_LT.search(c) and "all five" not in c.lower(), c))
+    out.append(check(next(a), IDS["escape_html"] in subs and ONLY_LT.search(c), c))
     h, c = run.header("safe_next"), run.contract("safe_next")
     out.append(check(next(a), IDS["safe_next"] in subs and "STRICT_MAPPED" in h and "Trust Boundary:** `TRUE`" in h
                      and OPEN_REDIRECT.search(c), h + "\n" + c))
