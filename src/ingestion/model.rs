@@ -93,4 +93,7 @@ pub struct ParsedFile {
     pub type_refs: Vec<TypeRef>,
     pub imports: Vec<ImportDecl>,
     pub impls: Vec<ImplRel>,
+    /// Go only: the package's full import path (`github.com/acme/app/internal/auth`), derived from
+    /// the nearest `go.mod` during sync. `None` when unknown.
+    pub package_path: Option<String>,
 }

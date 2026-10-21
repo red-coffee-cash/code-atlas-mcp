@@ -70,6 +70,10 @@ struct Index<'a> {
     imported_files: Vec<HashSet<usize>>,
     /// per file: local alias -> original imported name
     aliases: Vec<HashMap<&'a str, &'a str>>,
+    /// Go, per file: local package name (alias or last path segment) -> that package's files
+    go_imports: Vec<HashMap<&'a str, Vec<usize>>>,
+    /// Go, per file: files of dot-imported packages, whose names are callable unqualified
+    go_dot_imports: Vec<HashSet<usize>>,
 }
 
 /// Resolves all references in `files` to edges and marks symbols registered as route handlers
@@ -151,8 +155,24 @@ impl<'a> Index<'a> {
             module_keys,
             imported_files: vec![HashSet::new(); files.len()],
             aliases: vec![HashMap::new(); files.len()],
+            go_imports: vec![HashMap::new(); files.len()],
+            go_dot_imports: vec![HashSet::new(); files.len()],
         };
+        let go_packages = GoPackages::build(files, &index.module_keys);
         for (fi, f) in files.iter().enumerate() {
+            if f.language == Language::Go {
+                for imp in &f.imports {
+                    let targets: Vec<usize> =
+                        go_packages.resolve(&imp.module_path).into_iter().filter(|&t| t != fi).collect();
+                    index.imported_files[fi].extend(targets.iter().copied());
+                    if imp.name == "*" {
+                        index.go_dot_imports[fi].extend(targets);
+                    } else {
+                        index.go_imports[fi].insert(imp.alias.as_deref().unwrap_or(&imp.name), targets);
+                    }
+                }
+                continue;
+            }
             for imp in &f.imports {
                 let module = normalize_module(&imp.module_path);
                 let mut targets = index.files_for_module(&module);
@@ -160,11 +180,6 @@ impl<'a> Index<'a> {
                 if imp.name != "*" {
                     let joined = if module.is_empty() { imp.name.clone() } else { format!("{module}::{}", imp.name) };
                     targets.extend(index.files_for_module(&joined));
-                }
-                // Go imports are full module paths (`github.com/acme/app/auth`) that end in the
-                // repo-relative package directory, the reverse of the other languages.
-                if f.language == Language::Go {
-                    targets.extend(index.files_for_import_path(&module));
                 }
                 index.imported_files[fi].extend(targets.into_iter().filter(|&t| t != fi));
                 if let Some(alias) = &imp.alias {
@@ -198,14 +213,11 @@ impl<'a> Index<'a> {
         out
     }
 
-    fn files_for_import_path(&self, module: &str) -> Vec<usize> {
-        let suffix_of = |key: &str| !key.is_empty() && (module == key || module.ends_with(&format!("::{key}")));
-        self.module_keys
-            .iter()
-            .enumerate()
-            .filter(|(i, k)| suffix_of(k) && self.files[*i].language == Language::Go)
-            .map(|(i, _)| i)
-            .collect()
+    /// Same Go package: both Go files in one directory.
+    fn same_go_package(&self, a: usize, b: usize) -> bool {
+        self.files[a].language == Language::Go
+            && self.files[b].language == Language::Go
+            && self.module_keys[a] == self.module_keys[b]
     }
 
     fn sym(&self, r: SymRef) -> &'a ParsedSymbol {
@@ -217,6 +229,47 @@ impl<'a> Index<'a> {
             .get(name)
             .map(|v| v.iter().copied().filter(|&r| kinds.contains(&self.sym(r).kind)).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Maps Go import paths to the repo files of that package.
+enum GoPackages<'a> {
+    /// From `go.mod`: full import path -> files.
+    Exact(HashMap<&'a str, Vec<usize>>),
+    /// No `go.mod` known: match the import path's tail against package directories (`::dir`).
+    Suffix(Vec<(usize, String, String)>),
+}
+
+impl<'a> GoPackages<'a> {
+    fn build(files: &'a [ParsedFile], module_keys: &[String]) -> Self {
+        let go = || files.iter().enumerate().filter(|(_, f)| f.language == Language::Go);
+        if go().any(|(_, f)| f.package_path.is_some()) {
+            let mut map: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (i, f) in go() {
+                if let Some(p) = &f.package_path {
+                    map.entry(p.as_str()).or_default().push(i);
+                }
+            }
+            return Self::Exact(map);
+        }
+        Self::Suffix(
+            go().filter(|(i, _)| !module_keys[*i].is_empty())
+                .map(|(i, _)| (i, module_keys[i].clone(), format!("::{}", module_keys[i])))
+                .collect(),
+        )
+    }
+
+    fn resolve(&self, import_path: &str) -> Vec<usize> {
+        match self {
+            Self::Exact(map) => map.get(import_path).cloned().unwrap_or_default(),
+            Self::Suffix(keys) => {
+                let module = normalize_module(import_path);
+                keys.iter()
+                    .filter(|(_, k, sk)| module == *k || module.ends_with(sk.as_str()))
+                    .map(|(i, _, _)| *i)
+                    .collect()
+            }
+        }
     }
 }
 
@@ -232,11 +285,24 @@ fn narrow_by_receiver(
     receiver: &str,
     cands: Vec<SymRef>,
 ) -> Vec<SymRef> {
+    // `auth.Verify()` / `str.ToUpper()` in Go: the receiver names an imported package, so only that
+    // package's functions qualify; a package outside the repo (stdlib) yields nothing.
+    if let Some(pkg) = index.go_imports[caller_file].get(receiver.trim()) {
+        return cands.into_iter().filter(|r| pkg.contains(&r.0) && index.sym(*r).kind == "fn").collect();
+    }
     let segment = receiver.rsplit("::").next().unwrap_or(receiver).trim();
-    // `str.ToUpper(..)` after `import str "strings"`: the receiver is an alias for the package.
+    // `np.array(..)` after `import numpy as np`: the receiver is an alias for the module.
     let segment = index.aliases[caller_file].get(segment).copied().unwrap_or(segment);
-    let narrowed: Vec<SymRef> = if matches!(segment, "self" | "Self" | "this") {
-        cands.iter().copied().filter(|&r| r.0 == caller_file && scope_of(index.sym(r)) == scope_of(caller)).collect()
+    let narrowed: Vec<SymRef> = if is_self_receiver(caller, receiver) {
+        // Go methods of one type can live in any file of the package.
+        cands
+            .iter()
+            .copied()
+            .filter(|&r| {
+                (r.0 == caller_file || index.same_go_package(r.0, caller_file))
+                    && scope_of(index.sym(r)) == scope_of(caller)
+            })
+            .collect()
     } else {
         cands
             .iter()
@@ -257,10 +323,10 @@ fn narrow_by_receiver(
     cands.into_iter().filter(|&r| index.sym(r).kind == "method").collect()
 }
 
-/// `self`/`this`/`Self`, or the receiver variable of a Go method (`func (s *Server) Run()` -> `s`).
+/// `self`/`this`/`Self`/`cls`, or the receiver variable of a Go method (`func (s *Server) Run()` -> `s`).
 fn is_self_receiver(caller: &ParsedSymbol, receiver: &str) -> bool {
     let receiver = receiver.trim();
-    if matches!(receiver, "self" | "Self" | "this") {
+    if matches!(receiver, "self" | "Self" | "this" | "cls") {
         return true;
     }
     caller
@@ -268,6 +334,20 @@ fn is_self_receiver(caller: &ParsedSymbol, receiver: &str) -> bool {
         .strip_prefix("func (")
         .and_then(|rest| rest.split_whitespace().next())
         .is_some_and(|name| name == receiver)
+}
+
+/// Whether a caller->caller edge through `receiver` can be real recursion: a call on the receiver
+/// itself, or through the caller's own type (`Foo::build` in `impl Foo`, `Tree.walk` in `Tree`).
+fn may_recurse(caller: &ParsedSymbol, receiver: &str) -> bool {
+    let own_type = scope_of(caller).rsplit("::").next().unwrap_or("");
+    let segment = receiver.trim().rsplit(['.', ':']).next().unwrap_or("");
+    is_self_receiver(caller, receiver) || (!own_type.is_empty() && segment == own_type)
+}
+
+/// The class a symbol's body belongs to: a class symbol's own name (for class-body calls such as
+/// `before_action :x`), else its enclosing scope.
+fn own_scope(s: &ParsedSymbol) -> &str {
+    if s.kind == "class" { s.qualified_name.as_str() } else { scope_of(s) }
 }
 
 fn pick_tier(index: &Index, caller_file: usize, cands: &[SymRef]) -> Option<(Vec<SymRef>, Tier)> {
@@ -338,10 +418,17 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
                 let own: Vec<SymRef> = cands
                     .iter()
                     .copied()
-                    .filter(|&r| index.sym(r).kind == "method" && scope_of(index.sym(r)) == scope_of(caller))
+                    .filter(|&r| index.sym(r).kind == "method" && scope_of(index.sym(r)) == own_scope(caller))
                     .collect();
                 if !own.is_empty() {
                     cands = own;
+                }
+            }
+            if file.language == Language::Go && call.receiver.is_none() {
+                // An unqualified Go name is declared in the caller's own package or a dot-import.
+                cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0));
+                if cands.is_empty() {
+                    continue;
                 }
             }
             if let Some(r) = &call.receiver {
@@ -366,8 +453,8 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
             let conf = if tier == Tier::Exact { "STATIC_EXACT" } else { "STATIC_HEURISTIC" };
             // `fd.inner.Close()` inside `Close` delegates to another value that happens to share the
             // method name; only a call on the receiver itself can be real recursion.
-            let delegating = call.kind == CallKind::SymbolRef
-                || call.receiver.as_deref().is_some_and(|r| !is_self_receiver(caller, r));
+            let delegating =
+                call.kind == CallKind::SymbolRef || call.receiver.as_deref().is_some_and(|r| !may_recurse(caller, r));
             for t in targets {
                 let target = index.sym(t);
                 if delegating && target.symbol_id == caller.symbol_id {
@@ -535,6 +622,118 @@ mod tests {
             edges.iter().any(|e| e.from == id(&files, "Walk") && e.to == id(&files, "Walk")),
             "real recursion on the receiver stays"
         );
+    }
+
+    fn parse_as(path: &str, language: Language, src: &str) -> ParsedFile {
+        parse_file(&SourceFile {
+            rel_path: path.into(),
+            language,
+            source: src.into(),
+            blake3: String::new(),
+            line_count: 0,
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    fn calls_between(edges: &[Edge], files: &[ParsedFile], from: (&str, &str), to: (&str, &str)) -> Option<Edge> {
+        let sym = |(path, name): (&str, &str)| {
+            files
+                .iter()
+                .find(|f| f.rel_path == path)
+                .unwrap()
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .symbol_id
+                .clone()
+        };
+        let (f, t) = (sym(from), sym(to));
+        edges.iter().find(|e| e.from == f && e.to == t && e.kind == "CALLS").cloned()
+    }
+
+    #[test]
+    fn go_bare_calls_stay_in_their_package() {
+        let mut files = vec![
+            parse_as(
+                "internal/auth/a.go",
+                Language::Go,
+                "package auth\nimport \"example.com/app/internal/util\"\nfunc Run() { helper(); util.Other() }",
+            ),
+            parse_as("internal/auth/b.go", Language::Go, "package auth\nfunc helper() {}"),
+            parse_as("internal/util/u.go", Language::Go, "package util\nfunc helper() {}\nfunc Other() {}"),
+        ];
+        let edges = link(&mut files);
+        let sibling = calls_between(&edges, &files, ("internal/auth/a.go", "Run"), ("internal/auth/b.go", "helper"));
+        assert_eq!(sibling.expect("same-package helper").confidence, "STATIC_EXACT");
+        assert!(
+            calls_between(&edges, &files, ("internal/auth/a.go", "Run"), ("internal/util/u.go", "helper")).is_none()
+        );
+        assert!(
+            calls_between(&edges, &files, ("internal/auth/a.go", "Run"), ("internal/util/u.go", "Other")).is_some()
+        );
+    }
+
+    #[test]
+    fn go_stdlib_imports_never_link_to_same_named_repo_packages() {
+        let mut files = vec![
+            parse_as("cmd/m.go", Language::Go, "package main\nimport \"errors\"\nfunc main() { errors.New(\"x\") }"),
+            parse_as("pkg/errors/e.go", Language::Go, "package errors\nfunc New(s string) error { return nil }"),
+        ];
+        let edges = link(&mut files);
+        assert!(edges.iter().all(|e| e.kind != "CALLS"), "{edges:#?}");
+    }
+
+    #[test]
+    fn go_receiver_variables_narrow_to_their_own_type_across_package_files() {
+        let mut files = vec![
+            parse_as("p/a.go", Language::Go, "package p\ntype A struct{}\nfunc (a *A) Run() { a.start() }"),
+            parse_as("p/a_start.go", Language::Go, "package p\nfunc (a *A) start() {}"),
+            parse_as("p/b.go", Language::Go, "package p\ntype B struct{}\nfunc (b *B) start() {}"),
+        ];
+        let edges = link(&mut files);
+        let own = calls_between(&edges, &files, ("p/a.go", "Run"), ("p/a_start.go", "start")).expect("A.start");
+        assert_eq!(own.confidence, "STATIC_EXACT");
+        assert!(calls_between(&edges, &files, ("p/a.go", "Run"), ("p/b.go", "start")).is_none());
+    }
+
+    #[test]
+    fn recursion_through_the_callers_own_type_is_kept() {
+        let mut rs = vec![parse_as(
+            "src/a.rs",
+            Language::Rust,
+            "struct Foo;\nimpl Foo { fn build(n: u32) -> Foo { if n == 0 { Foo } else { Foo::build(n - 1) } } }",
+        )];
+        let edges = link(&mut rs);
+        assert!(calls_between(&edges, &rs, ("src/a.rs", "build"), ("src/a.rs", "build")).is_some(), "{edges:#?}");
+
+        let mut py = vec![parse_as(
+            "t.py",
+            Language::Python,
+            "class Tree:\n    @classmethod\n    def walk(cls, n):\n        cls.walk(n - 1)\n    @staticmethod\n    def visit(n):\n        Tree.visit(n - 1)\n",
+        )];
+        let edges = link(&mut py);
+        assert!(calls_between(&edges, &py, ("t.py", "walk"), ("t.py", "walk")).is_some(), "{edges:#?}");
+        assert!(calls_between(&edges, &py, ("t.py", "visit"), ("t.py", "visit")).is_some(), "{edges:#?}");
+    }
+
+    #[test]
+    fn ruby_class_body_callbacks_resolve_within_their_own_class() {
+        let mut files = vec![parse_as(
+            "app/c.rb",
+            Language::Ruby,
+            "class User\n  before_action :check\n  def check; end\nend\nclass Admin\n  def check; end\nend\n",
+        )];
+        let edges = link(&mut files);
+        let ids = |name: &str| {
+            files[0].symbols.iter().filter(|s| s.name == name).map(|s| s.symbol_id.clone()).collect::<Vec<_>>()
+        };
+        let user = ids("User")[0].clone();
+        let from_user: Vec<_> = edges.iter().filter(|e| e.from == user && e.kind == "CALLS").collect();
+        assert_eq!(from_user.len(), 1, "{from_user:#?}");
+        assert!(from_user[0].to.contains("::User::check#"), "{}", from_user[0].to);
+        assert_eq!(from_user[0].confidence, "STATIC_EXACT");
     }
 
     #[test]

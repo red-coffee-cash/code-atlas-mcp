@@ -138,7 +138,9 @@ impl Frontend for GoFrontend {
         let path = text(path, src).trim_matches(|c| c == '"' || c == '`').to_string();
         let last = path.rsplit('/').next().unwrap_or(&path).to_string();
         match node.child_by_field_name("name") {
-            Some(n) if matches!(n.kind(), "dot" | "blank_identifier") => {
+            // `_` imports run init() only and bring no names into scope
+            Some(n) if n.kind() == "blank_identifier" => {}
+            Some(n) if n.kind() == "dot" => {
                 out.push(ImportDecl { module_path: path, name: "*".to_string(), alias: None });
             }
             Some(n) => {
@@ -464,7 +466,7 @@ func check(int) {}
         let imp = |m: &str| p.imports.iter().find(|i| i.module_path == m).unwrap_or_else(|| panic!("no import {m}"));
         assert_eq!((imp("fmt").name.as_str(), imp("fmt").alias.clone()), ("fmt", None));
         assert_eq!((imp("strings").name.as_str(), imp("strings").alias.as_deref()), ("strings", Some("str")));
-        assert_eq!(imp("net/http/pprof").name, "*");
+        assert!(!p.imports.iter().any(|i| i.module_path == "net/http/pprof"), "blank imports bind nothing");
         assert_eq!(imp("os").name, "*");
         assert_eq!(imp("github.com/acme/app/auth").name, "auth");
     }

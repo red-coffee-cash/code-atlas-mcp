@@ -58,6 +58,7 @@ pub fn parse_file(file: &SourceFile) -> Result<Option<ParsedFile>> {
         type_refs: Vec::new(),
         imports: Vec::new(),
         impls: fe.implements(root, src),
+        package_path: None,
     };
 
     apply_risks(&compiled.risks, root, src, &mut symbols, &spans);

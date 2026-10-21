@@ -44,6 +44,7 @@ pub fn sync_repository(db: &DbInstance, repo_root: &Path) -> Result<SyncReport> 
     report.files_failed = failed;
     report.files_unsupported = unsupported;
 
+    assign_go_package_paths(repo_root, &mut parsed);
     let linked = linker::link(&mut parsed);
 
     let old_symbols = queries::symbol_ids(db)?;
@@ -109,6 +110,48 @@ pub fn sync_repository(db: &DbInstance, repo_root: &Path) -> Result<SyncReport> 
     report.cyclic_scc_count = topo.cyclic_scc_count;
     report.max_topological_level = topo.max_level;
     Ok(report)
+}
+
+/// Sets `package_path` on Go files from the nearest enclosing `go.mod`, so imports resolve to repo
+/// packages exactly instead of by directory-name suffix.
+fn assign_go_package_paths(repo_root: &Path, files: &mut [ParsedFile]) {
+    let mut cache: HashMap<String, Option<(String, String)>> = HashMap::new();
+    for f in files.iter_mut().filter(|f| f.language == walker::Language::Go) {
+        let dir = f.rel_path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        f.package_path = go_module_of(repo_root, &dir, &mut cache).map(|(module, module_dir)| {
+            match dir.strip_prefix(module_dir.as_str()).map(|r| r.trim_start_matches('/')) {
+                Some("") => module,
+                Some(rest) => format!("{module}/{rest}"),
+                None => module,
+            }
+        });
+    }
+}
+
+/// `(module path, repo-relative directory of its go.mod)` for the module containing `dir`.
+fn go_module_of(
+    repo_root: &Path,
+    dir: &str,
+    cache: &mut HashMap<String, Option<(String, String)>>,
+) -> Option<(String, String)> {
+    if let Some(hit) = cache.get(dir) {
+        return hit.clone();
+    }
+    let here = std::fs::read_to_string(repo_root.join(dir).join("go.mod")).ok().and_then(|gomod| {
+        gomod.lines().find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("module")
+                .filter(|r| r.starts_with(char::is_whitespace))
+                .map(|r| (r.trim().trim_matches('"').to_string(), dir.to_string()))
+        })
+    });
+    let found = match here {
+        Some(m) => Some(m),
+        None if dir.is_empty() => None,
+        None => go_module_of(repo_root, dir.rsplit_once('/').map_or("", |(d, _)| d), cache),
+    };
+    cache.insert(dir.to_string(), found.clone());
+    found
 }
 
 /// Parses in parallel; returns files in input order plus failure and unsupported counts.
@@ -317,6 +360,30 @@ mod tests {
         );
         let has = |a: &str, b: &str| calls.iter().any(|r| r[0].get_str() == Some(a) && r[1].get_str() == Some(b));
         assert!(has("index", "load_users"), "{calls:?}");
+    }
+
+    #[test]
+    fn go_mod_module_path_resolves_imports_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/app\n\ngo 1.22\n");
+        write(dir.path(), "auth/auth.go", "package auth\n\nfunc Verify() {}\n");
+        write(dir.path(), "errors/errors.go", "package errors\n\nfunc New(s string) error { return nil }\n");
+        write(
+            dir.path(),
+            "cmd/app/main.go",
+            "package main\n\nimport (\n\t\"errors\"\n\tauth \"github.com/other/auth\"\n\tmine \"example.com/app/auth\"\n)\n\nfunc main() {\n\terrors.New(\"x\")\n\tauth.Verify()\n\tmine.Verify()\n}\n",
+        );
+        let db = schema::open_in_memory().unwrap();
+
+        sync_repository(&db, dir.path()).unwrap();
+        let calls = run(
+            &db,
+            "?[a, b, c] := *symbol_edge{from_symbol_id: x, to_symbol_id: y, edge_kind: 'CALLS', confidence: c}, \
+             *symbol_node{symbol_id: x, name: a}, *symbol_node{symbol_id: y, name: b}",
+        );
+        // only the import of the repo's own module links; stdlib `errors` and the external `auth` do not
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0][1].get_str(), calls[0][2].get_str()), (Some("Verify"), Some("STATIC_EXACT")));
     }
 
     #[test]
