@@ -94,8 +94,9 @@ rollups, flows), then the Auditor prompt.
   locals and closures are not. Visibility is `pub` iff the name is exported.
 * Interfaces are structural, so no `IMPLEMENTS` edges are emitted for Go yet.
 * `vendor/` directories are skipped for Go (and Ruby) files.
-* Import paths are matched to repo packages by directory suffix (module path from `go.mod` is not read),
-  so a same-named package from another module can produce a heuristic edge.
+* Import paths resolve through the nearest `go.mod` to exact repo packages; stdlib and third-party
+  imports link to nothing. Without a `go.mod`, paths fall back to directory-suffix matching.
+  Unqualified calls resolve only within the caller's package (any file of its directory) or dot-imports.
 * Only the first name of `const A, B = 1, 2` becomes a symbol. `goto` and labels are treated as simple
   statements in CFGs.
 
