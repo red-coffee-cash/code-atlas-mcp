@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Query};
 
-use super::model::{ImplRel, ImportDecl, TypeExpr, TypeFacts};
+use super::model::{Arity, CallArgs, ImplRel, ImportDecl, TypeExpr, TypeFacts};
 use super::walker::{Language, SourceFile};
 
 pub mod go;
@@ -56,6 +56,21 @@ pub trait Frontend: Sync {
 
     /// Inheritance and trait-implementation relations declared in the file.
     fn implements(&self, _root: Node, _src: &[u8]) -> Vec<ImplRel> {
+        Vec::new()
+    }
+
+    /// Positional parameters a definition accepts.
+    fn arity(&self, _def: Node, _src: &[u8]) -> Option<Arity> {
+        None
+    }
+
+    /// The argument shape of a call site.
+    fn call_args(&self, _site: Node, _src: &[u8]) -> Option<CallArgs> {
+        None
+    }
+
+    /// The types of a call's positional arguments, as far as the caller's code shows them.
+    fn call_arg_types(&self, _site: Node, _src: &[u8]) -> Vec<Option<TypeExpr>> {
         Vec::new()
     }
 

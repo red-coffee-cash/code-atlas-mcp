@@ -97,23 +97,43 @@ rollups, flows), then the Auditor prompt.
 * Import paths resolve through the nearest `go.mod` to exact repo packages; stdlib and third-party
   imports link to nothing. Without a `go.mod`, paths fall back to directory-suffix matching.
   Unqualified calls resolve only within the caller's package (any file of its directory) or dot-imports.
+* Method calls are resolved by type where the caller's code shows it: receivers, parameters, locals
+  (`:=`, `var`, `range`, type switches, composite literals, `new`/`make`), struct fields (including
+  embedded ones), function and method results, and package variables. A struct's method is an exact
+  edge; an interface call is a heuristic edge to every repo type with the interface's full method
+  set (class-hierarchy analysis, also for common stdlib interfaces such as `io.Writer` and `error`);
+  a call on a stdlib/third-party concrete type, a field, or an anonymous struct links to nothing.
+  Receivers of unknown type fall back to name matching.
+* Builds are resolved as linux/amd64 with cgo: among platform variants of one name (`_windows.go`,
+  `//go:build`), the default build's wins. Production code never links into `_test.go` files.
 * Only the first name of `const A, B = 1, 2` becomes a symbol. `goto` and labels are treated as simple
   statements in CFGs.
 
 ### Ruby notes
 * Classes and modules are both kind `class` (disambiguated by scope); `class Foo::Bar` is the symbol
   `Bar` under scope `Foo`. Constants at top level or in a class body are `const`; locals and `@ivars`
-  are not symbols. `def self.x` and an instance `x` get distinct IDs through the line marker.
+  are not symbols. `def self.x` and an instance `x` get distinct IDs (a `self.` marker in the hash).
 * Visibility follows bare `private`/`protected`/`public`, `private :a`, `private def x` and
   `private_class_method`; `protected` is reported as `private`.
 * `class A < B` and `include`/`extend`/`prepend M` become `IMPLEMENTS` edges. `require`/`require_relative`/
   `load`/`autoload` with literal paths are imports.
-* Receiver-less calls inside a class resolve to that class's methods first. Method names passed as
-  symbols (`before_action :x`, `send(:x)`, `&:x`) are `SymbolRef` edges.
-* Not modelled: paren-less bare self-calls (`helper` is indistinguishable from a local variable),
-  `define_method`, `method_missing`, `Struct.new` classes, `Module#prepend` ordering, and block-style
-  routes (`get '/x' do`, `task :x do`), whose bodies belong to the enclosing symbol. Expect many
-  heuristic edges (duck typing).
+* Calls resolve through a class model (classes by qualified name, ancestors from `<`/`include`/
+  `extend`/`prepend`, Ruby constant lookup). Self calls go to the class and its ancestors, then the
+  classes that mix a module in, then top-level methods, never an unrelated class. `Foo.x` and
+  `Foo.new` (-> `initialize`) resolve in `Foo` (class methods preferred), or to nothing when `Foo` is
+  not a repo class. Receivers are typed from `Foo.new`, literals (core types), `self`/`self.class`,
+  instance variables assigned in the class, method results (last expression, `attr_reader`s), and
+  positional parameters whose every resolved caller passes the same repo class (closed-world: an
+  unseen caller could pass something else).
+* Methods without a `def` (`attr_*`, `Struct.new` members, `alias`, `alias_method`, delegators) are
+  part of the method table: they shadow ancestors and count as candidates. On a receiver of unknown
+  type, a name that more than 8 classes respond to, or that core classes define (`each`, `to_s`,
+  `fetch`, `new`, ...), is too generic to link; calls must also match the candidate's arity.
+* Method names passed as symbols (`before_action :x`, `send(:x)`, `&:x`) are `SymbolRef` edges.
+* Not modelled: paren-less bare self-calls as call sites (`helper` alone is indistinguishable from a
+  local variable), `define_method` with dynamic names, `method_missing`, `Module#prepend` ordering, and
+  block-style routes (`get '/x' do`, `task :x do`), whose bodies belong to the enclosing symbol.
+  Block variables and parameters without typed callers stay untyped (heuristic edges).
 
 ## Development
 

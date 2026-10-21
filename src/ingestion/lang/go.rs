@@ -165,7 +165,11 @@ impl Frontend for GoFrontend {
                         Some(result)
                     };
                     if let Some(t) = first {
-                        facts.results.push((owner, text(name, src).to_string(), text(t, src).to_string()));
+                        facts.results.push((
+                            owner,
+                            text(name, src).to_string(),
+                            TypeExpr::Named(text(t, src).to_string()),
+                        ));
                     }
                 }
                 "var_declaration" => {
@@ -251,6 +255,16 @@ fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
                     "method_elem" => {
                         if let Some(n) = m.child_by_field_name("name") {
                             facts.iface_methods.push((name.to_string(), text(n, src).to_string()));
+                            if let Some(t) = m.child_by_field_name("result").and_then(|r| {
+                                if r.kind() == "parameter_list" {
+                                    r.named_child(0)?.child_by_field_name("type")
+                                } else {
+                                    Some(r)
+                                }
+                            }) {
+                                let result = TypeExpr::Named(text(t, src).to_string());
+                                facts.results.push((name.to_string(), text(n, src).to_string(), result));
+                            }
                         }
                     }
                     "type_elem" => facts.embeds.push((name.to_string(), text(m, src).to_string())),

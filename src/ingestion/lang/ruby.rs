@@ -4,7 +4,7 @@ use anyhow::Result;
 use tree_sitter::Node;
 
 use super::{Compiled, Frontend, own_line, text};
-use crate::ingestion::model::{ImplRel, ImportDecl, TypeExpr, TypeFacts};
+use crate::ingestion::model::{Arity, CallArgs, ImplRel, ImportDecl, TypeExpr, TypeFacts};
 use crate::ingestion::walker::SourceFile;
 
 pub struct RubyFrontend {
@@ -216,24 +216,139 @@ impl Frontend for RubyFrontend {
         matches!(node.kind(), "method" | "singleton_method" | "class" | "module")
     }
 
+    fn arity(&self, def: Node, _src: &[u8]) -> Option<Arity> {
+        if !matches!(def.kind(), "method" | "singleton_method") {
+            return None;
+        }
+        let mut a = Arity { min: 0, max: Some(0), keywords: false };
+        for p in def.child_by_field_name("parameters").map(named_kids).unwrap_or_default() {
+            match p.kind() {
+                "identifier" | "destructured_parameter" => {
+                    a.min += 1;
+                    a.max = a.max.map(|m| m + 1);
+                }
+                "optional_parameter" => a.max = a.max.map(|m| m + 1),
+                "splat_parameter" | "forward_parameter" => a.max = None,
+                "keyword_parameter" | "hash_splat_parameter" | "hash_splat_nil" => a.keywords = true,
+                _ => {}
+            }
+        }
+        Some(a)
+    }
+
+    fn call_args(&self, site: Node, _src: &[u8]) -> Option<CallArgs> {
+        let mut args = CallArgs { positional: 0, keywords: false };
+        for a in site.child_by_field_name("arguments").map(named_kids).unwrap_or_default() {
+            match a.kind() {
+                "pair" => args.keywords = true,
+                "block_argument" => {}
+                "splat_argument" | "hash_splat_argument" | "forward_argument" => return None,
+                _ => args.positional += 1,
+            }
+        }
+        Some(args)
+    }
+
     fn receiver_type(&self, receiver: Node, src: &[u8]) -> Option<TypeExpr> {
         expr_type(receiver, src, 0)
     }
 
-    /// `@x = Foo.new(..)` anywhere in a class types `@x` for the whole class.
+    fn call_arg_types(&self, site: Node, src: &[u8]) -> Vec<Option<TypeExpr>> {
+        let mut out = Vec::new();
+        for a in site.child_by_field_name("arguments").map(named_kids).unwrap_or_default() {
+            match a.kind() {
+                "pair" | "block_argument" => {}
+                "splat_argument" | "hash_splat_argument" | "forward_argument" => break,
+                _ => out.push(expr_type(a, src, 0)),
+            }
+        }
+        out
+    }
+
+    /// `@x = Foo.new(..)` anywhere in a class types `@x` for the whole class. Also records the
+    /// methods a class gets without a `def` (accessors, Struct members, aliases, delegators).
     fn type_facts(&self, root: Node, src: &[u8]) -> TypeFacts {
         let mut facts = TypeFacts::default();
+        let class_qn = |class: Node| {
+            let mut chain = self.scope_chain(class, src);
+            chain.push(class.child_by_field_name("name").map_or("", |c| last_segment(text(c, src))).to_string());
+            chain.join("::")
+        };
         crate::ingestion::parser::walk(root, |n| {
+            // `Point = Struct.new(:x, :y)` and `class Point < Struct.new(:x, :y)`
+            let struct_members = |call: Node| -> Option<Vec<String>> {
+                let r = call.child_by_field_name("receiver")?;
+                let m = call.child_by_field_name("method")?;
+                (call.kind() == "call" && text(r, src) == "Struct" && text(m, src) == "new")
+                    .then(|| symbol_args(call, src))
+            };
+            if n.kind() == "assignment"
+                && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
+                && l.kind() == "constant"
+                && let Some(members) = struct_members(r)
+            {
+                let qn = match enclosing_type(n) {
+                    Some(c) => format!("{}::{}", class_qn(c), text(l, src)),
+                    None => text(l, src).to_string(),
+                };
+                accessor_methods(&qn, &members, true, &mut facts.methods);
+                facts.classes.push(qn);
+            }
+            if n.kind() == "class"
+                && let Some(sup) = n.child_by_field_name("superclass").and_then(|s| s.named_child(0))
+                && let Some(members) = struct_members(sup)
+            {
+                accessor_methods(&class_qn(n), &members, true, &mut facts.methods);
+            }
+            // a method's result: its last expression, when that has a known type
+            if matches!(n.kind(), "method" | "singleton_method")
+                && let Some(class) = enclosing_type(n)
+                && let Some(name) = n.child_by_field_name("name")
+                && let Some(last) = n.child_by_field_name("body").and_then(|b| {
+                    named_kids(b).into_iter().rfind(|c| !matches!(c.kind(), "rescue" | "else" | "ensure"))
+                })
+                && let Some(t) = expr_type(last, src, 0)
+            {
+                facts.results.push((class_qn(class), text(name, src).to_string(), t));
+            }
+            if let Some(class) = enclosing_type(n) {
+                let defined: Vec<String> = match n.kind() {
+                    "alias" => n.child_by_field_name("name").map(|a| text(a, src).to_string()).into_iter().collect(),
+                    "call" if n.child_by_field_name("receiver").is_none() => {
+                        let method = n.child_by_field_name("method").map_or("", |m| text(m, src));
+                        let args = symbol_args(n, src);
+                        match method {
+                            "attr_reader" | "attr" => {
+                                reader_results(&class_qn(class), &args, &mut facts.results);
+                                args
+                            }
+                            "attr_writer" => args.iter().map(|a| format!("{a}=")).collect(),
+                            "attr_accessor" => {
+                                reader_results(&class_qn(class), &args, &mut facts.results);
+                                accessor_methods(&class_qn(class), &args, true, &mut facts.methods);
+                                Vec::new()
+                            }
+                            "alias_method" | "define_method" => args.into_iter().take(1).collect(),
+                            "def_delegators" | "delegate" => {
+                                args.into_iter().skip(usize::from(method == "def_delegators")).collect()
+                            }
+                            "def_delegator" => args.get(2).or(args.get(1)).cloned().into_iter().collect(),
+                            _ => Vec::new(),
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                let qn = class_qn(class);
+                facts.methods.extend(defined.into_iter().map(|m| (qn.clone(), m)));
+            }
             if matches!(n.kind(), "assignment" | "operator_assignment")
                 && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
                 && l.kind() == "instance_variable"
                 && let Some(class) = enclosing_type(n)
-                && let Some(TypeExpr::Named(t)) = expr_type(r, src, 0)
-                && t != "self"
+                && let Some(t) = expr_type(r, src, 0)
+                && t != TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), text(l, src).to_string())
             {
-                let mut chain = self.scope_chain(class, src);
-                chain.push(class.child_by_field_name("name").map_or("", |c| last_segment(text(c, src))).to_string());
-                facts.fields.push((chain.join("::"), text(l, src).to_string(), TypeExpr::Named(t)));
+                facts.fields.push((class_qn(class), text(l, src).to_string(), t));
             }
             true
         });
@@ -316,55 +431,168 @@ fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
     if depth > 6 {
         return None;
     }
+    let core = |c: &str| Some(TypeExpr::Named(c.to_string()));
     match n.kind() {
         "self" => Some(TypeExpr::Named("self".to_string())),
+        // literals have core types, which have no repo methods
+        "array" => core("Array"),
+        "hash" => core("Hash"),
+        "string" | "heredoc_beginning" | "chained_string" => core("String"),
+        "simple_symbol" | "delimited_symbol" => core("Symbol"),
+        "integer" => core("Integer"),
+        "float" => core("Float"),
+        "regex" => core("Regexp"),
+        "range" => core("Range"),
         "instance_variable" => {
             Some(TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), text(n, src).to_string()))
         }
         "parenthesized_statements" => expr_type(n.named_child(0)?, src, depth + 1),
+        "constant" | "scope_resolution" => Some(TypeExpr::Ident(text(n, src).to_string())),
+        "operator_assignment" | "assignment" => expr_type(n.child_by_field_name("right")?, src, depth + 1),
         "call" => {
             let method = text(n.child_by_field_name("method")?, src);
-            let receiver = n.child_by_field_name("receiver")?;
+            let Some(receiver) = n.child_by_field_name("receiver") else {
+                // `helper(x)`: a self call
+                return Some(self_call(method));
+            };
             match (receiver.kind(), method) {
                 ("constant" | "scope_resolution", "new") => Some(TypeExpr::Named(text(receiver, src).to_string())),
                 ("self", "class") => Some(TypeExpr::Named("self.class".to_string())),
-                _ => None,
+                _ => {
+                    let base = expr_type(receiver, src, depth + 1)?;
+                    Some(TypeExpr::Call(Box::new(TypeExpr::Field(Box::new(base), method.to_string()))))
+                }
             }
         }
-        "identifier" => local_type(n, src, depth),
+        "identifier" => match local_binding(n, src, depth) {
+            Some(t) => t,
+            // neither a local nor a parameter: a paren-less self call
+            None => Some(self_call(text(n, src))),
+        },
         _ => None,
     }
 }
 
-/// The type of the last assignment to a local before `ident` in its method; `None` for parameters,
-/// block variables and anything assigned from an expression of unknown type.
-fn local_type(ident: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
+fn self_call(method: &str) -> TypeExpr {
+    TypeExpr::Call(Box::new(TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), method.to_string())))
+}
+
+/// `Some(type)` when `ident` is a local or parameter of its method (`Some(None)` when its type is
+/// unknown: parameters, block variables, assignments from untyped expressions); `None` when it is
+/// neither, i.e. a paren-less method call.
+fn local_binding(ident: Node, src: &[u8], depth: u8) -> Option<Option<TypeExpr>> {
     let name = text(ident, src);
-    let method = {
-        let mut cur = ident.parent();
-        while let Some(n) =
-            cur.filter(|n| !matches!(n.kind(), "method" | "singleton_method" | "class" | "module" | "program"))
-        {
-            cur = n.parent();
+    let mut method = None;
+    let mut cur = ident.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "block" | "do_block" | "lambda" => {
+                let params = n.child_by_field_name("parameters");
+                if params.is_some_and(|p| param_names(p, src).iter().any(|p| p == name)) {
+                    return Some(None);
+                }
+            }
+            "method" | "singleton_method" => {
+                method = Some(n);
+                break;
+            }
+            "class" | "module" | "program" | "singleton_class" => break,
+            _ => {}
         }
-        cur.filter(|n| matches!(n.kind(), "method" | "singleton_method"))?
-    };
-    let mut found = None;
+        cur = n.parent();
+    }
+    let method = method?; // class bodies and scripts: leave unknown rather than guess
+    if let Some(params) = method.child_by_field_name("parameters") {
+        let kids = named_kids(params);
+        if let Some(i) = kids.iter().position(|p| param_names_of(*p, src) == name) {
+            // positional parameters are typed by the linker from their callers' arguments
+            let positional =
+                kids[..=i].iter().filter(|p| matches!(p.kind(), "identifier" | "optional_parameter")).count();
+            let method_name = method.child_by_field_name("name").map_or("", |n| text(n, src));
+            return Some(
+                matches!(kids[i].kind(), "identifier" | "optional_parameter")
+                    .then(|| TypeExpr::Param(method_name.to_string(), positional - 1)),
+            );
+        }
+    }
+    let mut last_before = None;
+    let mut assigned_anywhere = false;
     crate::ingestion::parser::walk(method, |n| {
-        if n.start_byte() >= ident.start_byte() {
-            return false;
-        }
         if matches!(n.kind(), "assignment" | "operator_assignment")
             && let Some(l) = n.child_by_field_name("left")
-            && l.kind() == "identifier"
-            && text(l, src) == name
-            && n.end_byte() <= ident.start_byte()
         {
-            found = Some(n.child_by_field_name("right").and_then(|r| expr_type(r, src, depth + 1)));
+            let targets = if l.kind() == "left_assignment_list" { named_kids(l) } else { vec![l] };
+            if targets.iter().any(|t| t.kind() == "identifier" && text(*t, src) == name) {
+                assigned_anywhere = true;
+                if n.end_byte() <= ident.start_byte() {
+                    let single = l.kind() == "identifier";
+                    last_before = Some(single.then(|| n.child_by_field_name("right")).flatten());
+                }
+            }
+        }
+        // `for x in xs`, `rescue => e`, block params of nested blocks named alike
+        if matches!(n.kind(), "for" | "exception_variable")
+            && named_kids(n).first().is_some_and(|v| text(*v, src) == name)
+        {
+            assigned_anywhere = true;
         }
         true
     });
-    found.flatten()
+    match last_before {
+        Some(right) => Some(right.and_then(|r| expr_type(r, src, depth + 1))),
+        None if assigned_anywhere => Some(None),
+        None => None,
+    }
+}
+
+fn param_names(params: Node, src: &[u8]) -> Vec<String> {
+    named_kids(params).into_iter().map(|p| param_names_of(p, src)).collect()
+}
+
+fn param_names_of(p: Node, src: &[u8]) -> String {
+    match p.kind() {
+        "identifier" => text(p, src).to_string(),
+        _ => p.child_by_field_name("name").map_or(String::new(), |n| text(n, src).to_string()),
+    }
+}
+
+/// Literal symbol or string arguments of a call: `attr_reader :a, "b"` -> [a, b].
+fn symbol_args(call: Node, src: &[u8]) -> Vec<String> {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .filter(|a| matches!(a.kind(), "simple_symbol" | "string"))
+        .filter_map(|a| match a.kind() {
+            "string" => literal(a, src),
+            _ => Some(text(a, src).trim_start_matches(':').to_string()),
+        })
+        .filter(|a| !a.starts_with('@'))
+        .collect()
+}
+
+fn named_kids(n: Node) -> Vec<Node> {
+    let mut c = n.walk();
+    n.named_children(&mut c).filter(|x| x.kind() != "comment").collect()
+}
+
+/// `attr_reader :x` returns `@x`.
+fn reader_results(class: &str, names: &[String], out: &mut Vec<(String, String, TypeExpr)>) {
+    for n in names {
+        let ivar = TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), format!("@{n}"));
+        out.push((class.to_string(), n.clone(), ivar));
+    }
+}
+
+/// A reader and, if `writer`, an `x=` writer per name.
+fn accessor_methods(class: &str, names: &[String], writer: bool, out: &mut Vec<(String, String)>) {
+    for n in names {
+        out.push((class.to_string(), n.clone()));
+        if writer {
+            out.push((class.to_string(), format!("{n}=")));
+        }
+    }
 }
 
 fn keyword_level(name: &str) -> Option<&'static str> {

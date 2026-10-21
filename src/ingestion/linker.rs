@@ -321,7 +321,7 @@ fn narrow_by_receiver(
     // package's functions qualify; a package outside the repo (stdlib) yields nothing.
     if let Some(pkg) = index.go_imports[caller_file].get(receiver.trim()) {
         let in_pkg = cands.into_iter().filter(|r| pkg.contains(&r.0) && index.sym(*r).kind == "fn").collect();
-        return go_prefer_default_build(index, in_pkg);
+        return go_in_build(index, caller_file, in_pkg);
     }
     let segment = receiver.rsplit("::").next().unwrap_or(receiver).trim();
     // `np.array(..)` after `import numpy as np`: the receiver is an alias for the module.
@@ -439,7 +439,11 @@ fn resolve_generic(
     if file.language == Language::Go && call.receiver.is_none() {
         // An unqualified Go name is declared in the caller's own package or a dot-import.
         cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0));
-        cands = go_prefer_default_build(index, cands);
+        cands = go_in_build(index, fi, cands);
+    }
+    // A call can only target a definition that accepts its arguments.
+    if let Some(args) = call.args {
+        cands.retain(|r| index.sym(*r).arity.is_none_or(|a| a.accepts(args)));
     }
     if cands.is_empty() {
         return None;
@@ -481,8 +485,9 @@ fn decide(targets: Vec<SymRef>, tier: Tier) -> Option<(Vec<SymRef>, Tier)> {
 /// is what calls on values of unknown type get.
 fn resolve_ruby(
     index: &Index,
-    caller: &ParsedSymbol,
+    file: &ParsedFile,
     fi: usize,
+    caller: &ParsedSymbol,
     call: &CallSite,
     name: &str,
 ) -> Option<Option<(Vec<SymRef>, Tier)>> {
@@ -490,17 +495,17 @@ fn resolve_ruby(
     let scope = own_scope(caller);
     // `Foo.x` and calls inside `def self.y` want class methods; calls on instances want instance
     // methods. `def self.x` and `def x` can coexist; when the wanted kind exists, keep only it.
-    let in_class = |class: &str, class_level: bool| {
-        let mut found = rb.lookup(class, name);
-        if found.is_empty() && name == "new" {
-            return rb.lookup(class, "initialize");
-        }
+    // `None`: no class in the ancestry defines it; `Some([])`: an accessor or alias (no symbol).
+    let in_class = |class: &str, class_level: bool| -> Option<Vec<SymRef>> {
+        let Some(mut found) = rb.lookup(class, name) else {
+            return (name == "new").then(|| rb.lookup(class, "initialize").unwrap_or_default());
+        };
         let singleton = |r: &SymRef| index.sym(*r).signature.starts_with("def self.");
         let wanted: Vec<SymRef> = found.iter().copied().filter(|r| singleton(r) == class_level).collect();
         if !wanted.is_empty() {
             found = wanted;
         }
-        found
+        Some(found)
     };
     // a class-body DSL call takes symbols naming instance methods (`before_action :x`)
     let self_level = if caller.kind == "class" {
@@ -514,8 +519,7 @@ fn resolve_ruby(
         // methods of Object. It never reaches an unrelated class.
         None | Some("self") => {
             if !scope.is_empty() {
-                let own = in_class(scope, self_level);
-                if !own.is_empty() {
+                if let Some(own) = in_class(scope, self_level) {
                     return Some(decide(own, Tier::Exact));
                 }
                 let below = rb.descendant_methods(scope, name);
@@ -533,33 +537,204 @@ fn resolve_ruby(
         // `Foo::Bar.build`: a class (or module) method, or `new` -> `initialize`. A constant that is
         // not a repo class (`File`, `JSON`) has no repo methods.
         Some(r) if is_const_path(r) => {
-            Some(rb.resolve_const(r, scope).and_then(|c| decide(in_class(&c, true), Tier::Exact)))
+            Some(rb.resolve_const(r, scope).and_then(|c| decide(in_class(&c, true).unwrap_or_default(), Tier::Exact)))
         }
-        // A receiver whose class the method shows (`x = Foo.new`, `@x`, `self.class`).
         Some(_) => {
-            let ty = call.receiver_type.as_ref()?;
-            let class_level = matches!(ty, TypeExpr::Named(t) if t == "self.class");
-            match ruby_receiver_class(index, scope, ty, 0)? {
-                Some(class) => Some(decide(in_class(&class, class_level), Tier::Exact)),
-                None => Some(None),
+            // A receiver whose class the method shows (`x = Foo.new`, `@x`, `self.class`).
+            // (a parameter typed from its callers is closed-world evidence, like a name defined
+            // once in the repo: one target is exact, several are heuristic)
+            if let Some(ty) = &call.receiver_type
+                && let Some(class) = ruby_receiver_class(index, scope, self_level, ty, 0)
+            {
+                return Some(class.and_then(|(c, level)| decide(in_class(&c, level).unwrap_or_default(), Tier::Exact)));
             }
+            // A value of unknown type: any class that responds to the name, counting the methods
+            // that have no `def` (accessors, Struct members). Too many responders is too generic
+            // to link, and when an accessor could be the target no `def` is certain.
+            let responders = rb.responders.get(name).map_or(0, HashSet::len);
+            if responders > MAX_HEURISTIC_CANDIDATES || RUBY_CORE_METHODS.contains(&name) {
+                return Some(None);
+            }
+            let resolved = resolve_generic(index, file, fi, caller, call, name);
+            let defined = rb.defining_classes(name);
+            Some(resolved.map(|(t, tier)| (t, if responders > defined { Tier::Heuristic } else { tier })))
         }
     }
 }
 
-/// `Some(Some(class))` for a repo class, `Some(None)` for a class outside the repo, `None` unknown.
-fn ruby_receiver_class(index: &Index, scope: &str, ty: &TypeExpr, depth: u8) -> Option<Option<String>> {
+/// The receiver's class and whether the receiver is the class object itself (class methods):
+/// `Some(Some(..))` for a repo class, `Some(None)` for a class outside the repo, `None` unknown.
+/// `self_level` is whether `self` is a class object (inside `def self.x`).
+fn ruby_receiver_class(
+    index: &Index,
+    scope: &str,
+    self_level: bool,
+    ty: &TypeExpr,
+    depth: u8,
+) -> Option<Option<(String, bool)>> {
+    if depth > 6 {
+        return None;
+    }
+    let d = depth + 1;
+    let rb = &index.ruby;
     match ty {
-        TypeExpr::Named(t) if t == "self" || t == "self.class" => (!scope.is_empty()).then(|| Some(scope.to_string())),
-        TypeExpr::Named(t) => Some(index.ruby.resolve_const(t, scope)),
-        TypeExpr::Field(base, ivar) if depth < 4 => {
-            let Some(Some(class)) = ruby_receiver_class(index, scope, base, depth + 1) else { return None };
-            let (owner, t) = index.ruby.ivar_type(&class, ivar)?;
-            ruby_receiver_class(index, &owner, t, depth + 1)
+        TypeExpr::Named(t) if t == "self" => (!scope.is_empty()).then(|| Some((scope.to_string(), self_level))),
+        TypeExpr::Named(t) if t == "self.class" => (!scope.is_empty()).then(|| Some((scope.to_string(), true))),
+        TypeExpr::Named(t) => Some(rb.resolve_const(t, scope).map(|c| (c, false))),
+        TypeExpr::Ident(t) => Some(rb.resolve_const(t, scope).map(|c| (c, true))),
+        TypeExpr::Field(base, ivar) => {
+            let (class, _) = ruby_receiver_class(index, scope, self_level, base, d)??;
+            let (owner, t) = rb.ivar_type(&class, ivar)?;
+            ruby_receiver_class(index, &owner, false, t, d)
         }
-        _ => None,
+        TypeExpr::Call(callee) => {
+            let TypeExpr::Field(base, m) = callee.as_ref() else { return None };
+            let (class, level) = ruby_receiver_class(index, scope, self_level, base, d)??;
+            match m.as_str() {
+                "new" if level => return Some(Some((class, false))),
+                "class" => return Some(Some((class, true))),
+                _ => {}
+            }
+            let (owner, t) = rb.result_type(&class, m)?;
+            ruby_receiver_class(index, &owner, level, t, d)
+        }
+        TypeExpr::Param(method, i) => {
+            let hit = rb.param_types.borrow().get(&(scope.to_string(), method.clone(), *i)).cloned()?;
+            Some(Some(hit))
+        }
+        TypeExpr::Elem(_) => None,
     }
 }
+
+/// Methods every Ruby value (Object, Kernel, Comparable) or the ubiquitous core collections and
+/// scalars (Enumerable, Array, Hash, String, Integer, IO) define. On a receiver of unknown type the
+/// runtime's own definitions are as likely as any repo one, so such a call is too generic to link.
+const RUBY_CORE_METHODS: &[&str] = &[
+    "new",
+    "initialize",
+    "class",
+    "to_s",
+    "inspect",
+    "hash",
+    "==",
+    "!=",
+    "===",
+    "=~",
+    "eql?",
+    "equal?",
+    "<=>",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "nil?",
+    "is_a?",
+    "kind_of?",
+    "instance_of?",
+    "respond_to?",
+    "send",
+    "public_send",
+    "dup",
+    "clone",
+    "freeze",
+    "frozen?",
+    "tap",
+    "then",
+    "object_id",
+    "instance_variable_get",
+    "instance_variable_set",
+    "method",
+    "methods",
+    "extend",
+    "display",
+    "to_a",
+    "to_h",
+    "to_str",
+    "to_sym",
+    "to_i",
+    "to_f",
+    "to_proc",
+    "each",
+    "each_with_index",
+    "each_with_object",
+    "map",
+    "flat_map",
+    "select",
+    "filter",
+    "reject",
+    "find",
+    "detect",
+    "find_all",
+    "include?",
+    "member?",
+    "any?",
+    "all?",
+    "none?",
+    "count",
+    "first",
+    "last",
+    "min",
+    "max",
+    "sort",
+    "sort_by",
+    "group_by",
+    "partition",
+    "reduce",
+    "inject",
+    "sum",
+    "zip",
+    "take",
+    "drop",
+    "uniq",
+    "compact",
+    "flatten",
+    "reverse",
+    "empty?",
+    "size",
+    "length",
+    "[]",
+    "[]=",
+    "<<",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "concat",
+    "delete",
+    "clear",
+    "fetch",
+    "dig",
+    "key?",
+    "has_key?",
+    "keys",
+    "values",
+    "merge",
+    "merge!",
+    "update",
+    "join",
+    "split",
+    "strip",
+    "chomp",
+    "sub",
+    "gsub",
+    "start_with?",
+    "end_with?",
+    "match",
+    "match?",
+    "upcase",
+    "downcase",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "read",
+    "write",
+    "close",
+    "puts",
+    "print",
+    "call",
+];
 
 fn is_const_path(r: &str) -> bool {
     r.trim_start_matches("::").split("::").all(|seg| {
@@ -587,6 +762,8 @@ struct GoModel<'a> {
     cha_cache: RefCell<HashMap<(String, String), Vec<SymRef>>>,
     /// per file: part of the default build (linux/amd64, cgo); false for other platforms' files
     default_build: Vec<bool>,
+    /// per file: a `_test.go` file
+    test_file: Vec<bool>,
 }
 
 /// A resolved Go type.
@@ -684,6 +861,7 @@ impl<'a> GoModel<'a> {
                 })
             })
             .collect();
+        m.test_file = files.iter().map(|f| f.language == Language::Go && f.rel_path.ends_with("_test.go")).collect();
         m.default_build = files
             .iter()
             .map(|f| {
@@ -718,7 +896,9 @@ impl<'a> GoModel<'a> {
                 m.iface.entry((p, iface.as_str())).or_default().push(method.as_str());
             }
             for (owner, name, ty) in &facts.results {
-                m.results.insert((p, owner.as_str(), name.as_str()), (ty.as_str(), fi));
+                if let TypeExpr::Named(t) = ty {
+                    m.results.insert((p, owner.as_str(), name.as_str()), (t.as_str(), fi));
+                }
             }
             for (name, ty) in &facts.vars {
                 m.vars.insert((p, name.as_str()), (ty, fi));
@@ -857,9 +1037,14 @@ fn go_constraint_holds(expr: &str) -> bool {
     or(&tokens, &mut 0)
 }
 
-/// Among same-named Go definitions in one package (platform variants selected by build
+/// The candidates that exist in the build the caller is part of. `_test.go` files are compiled
+/// only into test binaries, so production code can never reach their declarations (test code can
+/// reach everything). Among same-named definitions left (platform variants selected by build
 /// constraints), keep those of the default build when it has any.
-fn go_prefer_default_build(index: &Index, cands: Vec<SymRef>) -> Vec<SymRef> {
+fn go_in_build(index: &Index, caller_file: usize, mut cands: Vec<SymRef>) -> Vec<SymRef> {
+    if !index.go.test_file[caller_file] {
+        cands.retain(|r| !index.go.test_file[r.0]);
+    }
     if cands.len() < 2 {
         return cands;
     }
@@ -872,19 +1057,17 @@ fn go_prefer_default_build(index: &Index, cands: Vec<SymRef>) -> Vec<SymRef> {
 /// a func, a method promoted from an external embedded type).
 fn go_typed_call(index: &Index, fi: usize, rt: &TypeExpr, method: &str) -> Option<Option<(Vec<SymRef>, Tier)>> {
     Some(match go_resolve(index, fi, rt, 0)? {
-        GoType::Repo(p, t, "struct") => {
-            decide(go_prefer_default_build(index, go_method(index, p, &t, method, 0)), Tier::Exact)
-        }
+        GoType::Repo(p, t, "struct") => decide(go_in_build(index, fi, go_method(index, p, &t, method, 0)), Tier::Exact),
         GoType::Repo(p, t, _) => {
             let required = go_iface_methods(index, p, &t, 0);
-            decide(go_implementers(index, &required, method), Tier::Heuristic)
+            decide(go_in_build(index, fi, go_implementers(index, &required, method)), Tier::Heuristic)
         }
         GoType::External(t) => {
             let t = t.trim_start_matches('*');
             match GO_STD_INTERFACES.iter().find(|(name, _)| *name == t) {
                 Some((_, required)) => {
                     let required: Vec<String> = required.iter().map(|s| s.to_string()).collect();
-                    decide(go_implementers(index, &required, method), Tier::Heuristic)
+                    decide(go_in_build(index, fi, go_implementers(index, &required, method)), Tier::Heuristic)
                 }
                 None => None,
             }
@@ -1017,6 +1200,7 @@ fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<Go
             GoType::Container(t, cf) => go_resolve_text(index, cf, &t),
             _ => None,
         },
+        TypeExpr::Param(..) => None, // Go parameters carry their declared types
     }
 }
 
@@ -1110,13 +1294,24 @@ fn go_implementers(index: &Index, required: &[String], m: &str) -> Vec<SymRef> {
     out
 }
 
+/// (class, method, positional index) of a Ruby parameter.
+type ParamSlot = (String, String, usize);
+
 /// Ruby classes and modules by qualified name (a class reopened in several files is one class),
 /// their methods, and their ancestors from `<`, `include`, `extend` and `prepend`.
 #[derive(Default)]
 struct RubyModel<'a> {
     classes: HashSet<&'a str>,
-    /// (class, @ivar) -> type assigned in that class
-    ivars: HashMap<(&'a str, &'a str), &'a TypeExpr>,
+    /// (class, @ivar) -> type assigned in that class; `None` when assignments disagree
+    ivars: HashMap<(&'a str, &'a str), Option<&'a TypeExpr>>,
+    /// (class, method) -> type of its last expression; `None` when definitions disagree
+    results: HashMap<(&'a str, &'a str), Option<&'a TypeExpr>>,
+    /// (class, method, positional index) -> the class every resolved caller passes there
+    param_types: RefCell<HashMap<ParamSlot, (String, bool)>>,
+    /// (class, method) for methods without a `def` (accessors, Struct members, aliases)
+    implicit: HashSet<(&'a str, &'a str)>,
+    /// method name -> every class that has it, with or without a `def`
+    responders: HashMap<&'a str, HashSet<&'a str>>,
     methods: HashMap<(&'a str, &'a str), Vec<SymRef>>,
     ancestors: HashMap<String, Vec<String>>,
     descendants: HashMap<String, Vec<String>>,
@@ -1138,8 +1333,26 @@ impl<'a> RubyModel<'a> {
             }
         }
         for (_, f) in ruby() {
+            m.classes.extend(f.facts.classes.iter().map(String::as_str));
+            for (class, method) in &f.facts.methods {
+                m.implicit.insert((class.as_str(), method.as_str()));
+            }
+        }
+        for &(class, method) in m.methods.keys().chain(m.implicit.iter()) {
+            m.responders.entry(method).or_default().insert(class);
+        }
+        for (_, f) in ruby() {
             for (owner, ivar, ty) in &f.facts.fields {
-                m.ivars.insert((owner.as_str(), ivar.as_str()), ty);
+                let slot = m.ivars.entry((owner.as_str(), ivar.as_str())).or_insert(Some(ty));
+                if slot.is_some_and(|t| t != ty) {
+                    *slot = None;
+                }
+            }
+            for (owner, method, ty) in &f.facts.results {
+                let slot = m.results.entry((owner.as_str(), method.as_str())).or_insert(Some(ty));
+                if slot.is_some_and(|t| t != ty) {
+                    *slot = None;
+                }
             }
             for rel in &f.impls {
                 // the innermost class/module named `type_name` around the relation's line
@@ -1190,13 +1403,29 @@ impl<'a> RubyModel<'a> {
     /// The type assigned to `ivar` in `class` or the nearest ancestor that assigns it, with that
     /// class (the constant's lexical context).
     fn ivar_type(&self, class: &str, ivar: &str) -> Option<(String, &'a TypeExpr)> {
-        self.walk(class, &self.ancestors, |c| self.ivars.get(&(c, ivar)).map(|t| (c.to_string(), *t)))
+        self.walk(class, &self.ancestors, |c| self.ivars.get(&(c, ivar)).map(|t| t.map(|t| (c.to_string(), t))))
+            .flatten()
+    }
+
+    /// The result type of `method` on `class` or the nearest ancestor defining it, with that class.
+    fn result_type(&self, class: &str, method: &str) -> Option<(String, &'a TypeExpr)> {
+        self.walk(class, &self.ancestors, |c| self.results.get(&(c, method)).map(|t| t.map(|t| (c.to_string(), t))))
+            .flatten()
     }
 
     /// The methods named `name` on the nearest class in `class`'s ancestry (itself first).
-    fn lookup(&self, class: &str, name: &str) -> Vec<SymRef> {
-        self.walk(class, &self.ancestors, |c| self.methods.get(&(c, name)).filter(|v| !v.is_empty()).cloned())
-            .unwrap_or_default()
+    /// `None` when no class in the ancestry has the method; an empty list when the nearest one has
+    /// it without a `def`.
+    fn lookup(&self, class: &str, name: &str) -> Option<Vec<SymRef>> {
+        self.walk(class, &self.ancestors, |c| match self.methods.get(&(c, name)) {
+            Some(v) if !v.is_empty() => Some(v.clone()),
+            _ => self.implicit.contains(&(c, name)).then(Vec::new),
+        })
+    }
+
+    /// Classes with a `def` for `name`.
+    fn defining_classes(&self, name: &str) -> usize {
+        self.responders.get(name).map_or(0, |cs| cs.iter().filter(|c| self.methods.contains_key(&(**c, name))).count())
     }
 
     /// Methods named `name` in classes that inherit or mix in `class` (a module's host classes, a
@@ -1239,9 +1468,65 @@ impl<'a> RubyModel<'a> {
     }
 }
 
+fn resolve_call(
+    index: &Index,
+    fi: usize,
+    file: &ParsedFile,
+    caller: &ParsedSymbol,
+    call: &CallSite,
+) -> Option<(Vec<SymRef>, Tier)> {
+    let name = index.aliases[fi].get(call.target_name.as_str()).copied().unwrap_or(call.target_name.as_str());
+    match (file.language == Language::Ruby).then(|| resolve_ruby(index, file, fi, caller, call, name)) {
+        Some(Some(r)) => r,
+        _ => resolve_generic(index, file, fi, caller, call, name),
+    }
+}
+
+/// Types Ruby positional parameters from the arguments of the calls that resolve exactly to their
+/// method: a parameter gets a class only when every such call passes that same repo class. Runs
+/// to a fixpoint (a typed parameter can type the arguments it is passed on as).
+fn infer_ruby_params(index: &Index) {
+    for _ in 0..4 {
+        let mut seen: HashMap<ParamSlot, Option<(String, bool)>> = HashMap::new();
+        for (fi, file) in index.files.iter().enumerate().filter(|(_, f)| f.language == Language::Ruby) {
+            let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
+            for call in file.calls.iter().filter(|c| !c.arg_types.is_empty()) {
+                let Some(&caller) = by_id.get(call.from_symbol_id.as_str()) else { continue };
+                let Some((targets, Tier::Exact)) = resolve_call(index, fi, file, caller, call) else { continue };
+                let [t] = targets.as_slice() else { continue };
+                let target = index.sym(*t);
+                if target.kind != "method" && target.kind != "fn" {
+                    continue;
+                }
+                let self_level = caller.signature.starts_with("def self.");
+                for (i, arg) in call.arg_types.iter().enumerate() {
+                    let class = arg
+                        .as_ref()
+                        .and_then(|a| ruby_receiver_class(index, own_scope(caller), self_level, a, 0))
+                        .flatten();
+                    let key = (scope_of(target).to_string(), target.name.clone(), i);
+                    match seen.get_mut(&key) {
+                        None => {
+                            seen.insert(key, class);
+                        }
+                        Some(prev) if *prev != class => *prev = None,
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        let typed: HashMap<_, _> = seen.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+        if *index.ruby.param_types.borrow() == typed {
+            return;
+        }
+        *index.ruby.param_types.borrow_mut() = typed;
+    }
+}
+
 fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
     let mut acc = EdgeAcc { edges: BTreeMap::new() };
     let mut entrypoints = HashSet::new();
+    infer_ruby_params(index);
 
     for (fi, file) in index.files.iter().enumerate() {
         let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
@@ -1250,13 +1535,7 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
             let Some(&caller) = by_id.get(call.from_symbol_id.as_str()) else {
                 continue;
             };
-            let name = index.aliases[fi].get(call.target_name.as_str()).copied().unwrap_or(call.target_name.as_str());
-            let resolved = match (file.language == Language::Ruby).then(|| resolve_ruby(index, caller, fi, call, name))
-            {
-                Some(Some(r)) => r,
-                _ => resolve_generic(index, file, fi, caller, call, name),
-            };
-            let Some((targets, mut tier)) = resolved else {
+            let Some((targets, mut tier)) = resolve_call(index, fi, file, caller, call) else {
                 continue;
             };
             // `items.map(&:name)` / `other.send(:x)` name a method of an object of unknown type.
@@ -1711,6 +1990,63 @@ mod tests {
         let hook = edges.iter().find(|e| e.from == id(&files, "host_hook")).expect("module -> host class");
         assert!(hook.to.contains("::Cart::hook#"));
         assert_eq!(hook.confidence, "STATIC_HEURISTIC");
+    }
+
+    #[test]
+    fn ruby_unknown_receivers_count_implicit_methods_and_skip_core_names() {
+        let mut files = vec![parse_as(
+            "lib/m.rb",
+            Language::Ruby,
+            "class Spec\n  attr_reader :source\nend\nTuple = Struct.new(:source, :spec)\nclass Api\n  def source; end\n  def push(a, b); end\n  def each; end\nend\nclass Runner\n  def go(t, list)\n    t.source()\n    list.each()\n    list.push(1)\n    @items = []\n    @items.push(1, 2)\n  end\nend\n",
+        )];
+        let edges = link(&mut files);
+        let from_go: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "go")).collect();
+        let to = |q: &str| from_go.iter().find(|e| e.to.contains(q)).map(|e| e.confidence);
+        // Api#source is one of three classes with `source` (two without a def): not certain
+        assert_eq!(to("::Api::source#"), Some("STATIC_HEURISTIC"), "{from_go:#?}");
+        assert_eq!(to("::Api::each#"), None, "`each` on an unknown value is too generic");
+        assert_eq!(to("::Api::push#"), None, "push(1) cannot bind push(a, b), and @items is an Array");
+    }
+
+    #[test]
+    fn ruby_results_self_calls_and_caller_typed_params_resolve() {
+        let mut files = vec![parse_as(
+            "lib/n.rb",
+            Language::Ruby,
+            "class Conf
+  def verbose; end
+end
+class Other
+  def verbose; end
+  def render(x); end
+end
+class Page
+  def render(x); end
+end
+class App
+  def self.config
+    @config ||= Conf.new
+  end
+  def run
+    App.config.verbose()
+    show(Page.new)
+  end
+  def show(page)
+    page.render(1)
+  end
+end
+",
+        )];
+        let edges = link(&mut files);
+        let from = |caller: &str| edges.iter().filter(|e| e.from == id(&files, caller)).collect::<Vec<_>>();
+        let run = from("run");
+        let verbose: Vec<_> = run.iter().filter(|e| e.to.contains("::verbose#")).collect();
+        assert_eq!(verbose.len(), 1, "{run:#?}");
+        assert!(verbose[0].to.contains("::Conf::verbose#"));
+        assert_eq!(verbose[0].confidence, "STATIC_EXACT");
+        let show = from("show");
+        assert_eq!(show.len(), 1, "every caller passes a Page: {show:#?}");
+        assert!(show[0].to.contains("::Page::render#"));
     }
 
     #[test]

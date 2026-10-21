@@ -25,6 +25,35 @@ pub struct ParsedSymbol {
     /// Detected from the definition itself (main, route attributes, FFI exports).
     /// The linker may add more from callback registration (e.g. axum `.route`).
     pub is_entrypoint: bool,
+    /// Positional parameters it accepts, when the frontend knows (calls with another count can't
+    /// target it).
+    pub arity: Option<Arity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arity {
+    pub min: usize,
+    /// `None` with a splat (`*rest`).
+    pub max: Option<usize>,
+    /// Declares keyword parameters (`k:`, `**opts`), which absorb `key: value` arguments.
+    pub keywords: bool,
+}
+
+/// The argument shape of a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallArgs {
+    pub positional: usize,
+    /// Passes `key: value` pairs.
+    pub keywords: bool,
+}
+
+impl Arity {
+    /// Whether a call with `args` can bind to these parameters. Ruby passes trailing `k: v` pairs
+    /// to a method without keyword parameters as one positional hash.
+    pub fn accepts(&self, args: CallArgs) -> bool {
+        let n = args.positional + usize::from(args.keywords && !self.keywords);
+        n >= self.min && self.max.is_none_or(|max| n <= max)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +82,10 @@ pub struct CallSite {
     /// What the frontend could tell about the receiver's type from the caller's own code; the
     /// linker finishes it with repo-wide facts (field types, function results).
     pub receiver_type: Option<TypeExpr>,
+    /// `None` when unknown (a splat argument, a callback reference, an unsupported language).
+    pub args: Option<CallArgs>,
+    /// Types of the positional arguments, as far as the caller's code shows them.
+    pub arg_types: Vec<Option<TypeExpr>>,
 }
 
 /// A receiver's type as far as one file can tell. Resolved by the linker.
@@ -60,7 +93,8 @@ pub struct CallSite {
 pub enum TypeExpr {
     /// A type as written: `*pkg.T`, `[]T`, `map[K]V`, `Foo::Bar`.
     Named(String),
-    /// A name with no local binding: an import, or a package-level variable or function.
+    /// A name with no local binding: an import, or a package-level variable or function. In Ruby,
+    /// a constant used as a value: the class object itself (`Gem` in `Gem.configuration`).
     Ident(String),
     /// `x.f`: a field of `x` (or a package member, when `x` is an import).
     Field(Box<TypeExpr>, String),
@@ -68,6 +102,9 @@ pub enum TypeExpr {
     Call(Box<TypeExpr>),
     /// An element of a slice, array or map: `xs[i]`, the value of `range xs`.
     Elem(Box<TypeExpr>),
+    /// The positional parameter at this index of the named method (of the enclosing class), typed
+    /// by the linker from the arguments its callers pass.
+    Param(String, usize),
 }
 
 /// Declarations the linker needs to type receivers across files.
@@ -79,12 +116,17 @@ pub struct TypeFacts {
     pub embeds: Vec<(String, String)>,
     /// (interface, method) declared directly on a Go interface.
     pub iface_methods: Vec<(String, String)>,
-    /// (receiver type or "" for a function, name, first result type as written).
-    pub results: Vec<(String, String, String)>,
+    /// (receiver type or class, or "" for a function; name; (first) result type).
+    pub results: Vec<(String, String, TypeExpr)>,
     /// Package-level variables: (name, type).
     pub vars: Vec<(String, TypeExpr)>,
     /// Go `//go:build` constraint expression, if the file has one.
     pub build_constraint: Option<String>,
+    /// (class, method) for methods that exist without a `def`: Ruby accessors, `Struct` members,
+    /// aliases, delegators, `define_method` with a literal name.
+    pub methods: Vec<(String, String)>,
+    /// Classes defined without a `class` keyword (Ruby `Point = Struct.new(:x, :y)`).
+    pub classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

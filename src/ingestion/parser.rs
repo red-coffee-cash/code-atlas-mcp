@@ -167,6 +167,7 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
                 risk_flags: Vec::new(),
                 requires_strict_contract: false,
                 is_entrypoint,
+                arity: fe.arity(def, src),
             },
         });
     }
@@ -330,6 +331,8 @@ fn extract_calls(
                 kind: CallKind::Direct,
                 via: None,
                 receiver_type: cap("call.receiver").and_then(|r| fe.receiver_type(r, src)),
+                args: fe.call_args(site, src),
+                arg_types: fe.call_arg_types(site, src),
             });
         } else if let Some(r) = cap("call.callback_ref") {
             // `Self::handler`, `self.handler`, `mod.handler` carry a qualifier; a bare `handler`
@@ -354,6 +357,8 @@ fn extract_calls(
                 kind: if symbol_ref { CallKind::SymbolRef } else { CallKind::Callback },
                 via: cap("call.callback_via").map(|v| last_segment(text(v, src)).to_string()),
                 receiver_type: if symbol_ref { None } else { qualifier.and_then(|q| fe.receiver_type(q, src)) },
+                args: None,
+                arg_types: Vec::new(),
             });
         } else if let (Some(name), Some(tokens)) = (cap("macro.name"), cap("macro.tokens")) {
             let macro_name = last_segment(text(name, src)).to_string();
@@ -374,6 +379,8 @@ fn extract_calls(
                         kind: CallKind::MacroIdent,
                         via: Some(macro_name.clone()),
                         receiver_type: None,
+                        args: None,
+                        arg_types: Vec::new(),
                     });
                 }
                 true
