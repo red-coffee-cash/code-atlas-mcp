@@ -375,6 +375,10 @@ func m(s string) template.HTML { return template.HTML(s) }
 func n(r Reader) { gob.NewDecoder(r) }
 func o(ch chan int) {}
 func plain(a, b int) int { return a + b }
+func sx(db *DB, n string) { var u U; db.Get(&u, "SELECT * FROM t WHERE n = '" + n + "'") }
+func sxc(ctx Ctx, db *DB, n string) { var u []U; db.SelectContext(ctx, &u, fmt.Sprintf("SELECT %s", n)) }
+func notsql(c *Ctx, rdb *R, ctx Ctx, id string) { c.Get("user" + id); rdb.Get(ctx, "k" + id) }
+func fetch(base, path string) { http.Get(base + path) }
 "#,
         );
         let flags = |n: &str| sym(&p, n).risk_flags.clone();
@@ -394,6 +398,10 @@ func plain(a, b int) int { return a + b }
         assert_eq!(flags("n"), ["unsafe_deserialization"]);
         assert_eq!(flags("o"), ["concurrency_primitive"]);
         assert!(flags("plain").is_empty());
+        assert_eq!(flags("sx"), ["raw_sql"]);
+        assert_eq!(flags("sxc"), ["raw_sql"]);
+        assert!(flags("notsql").is_empty(), "{:?}", flags("notsql"));
+        assert_eq!(flags("fetch"), ["external_io"], "http.Get is I/O, not SQL");
         assert!(sym(&p, "a").requires_strict_contract);
     }
 

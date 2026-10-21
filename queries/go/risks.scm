@@ -44,22 +44,43 @@
   (#eq? @_o "http")
   (#any-of? @_f "Get" "Post" "PostForm" "Head")) @risk.io
 
-; string-built SQL handed to the database/sql query methods
+; string-built SQL. `sink` is a `+` concatenation or an `fmt.Sprintf` call; the query's argument
+; position differs per API, so each gets its own pattern.
+; database/sql, sqlx and gorm: the query is the first argument
 (call_expression
   function: (selector_expression field: (field_identifier) @_m)
   arguments: (argument_list . [
     (binary_expression operator: "+")
     (call_expression function: (selector_expression operand: (identifier) @_p field: (field_identifier) @_s (#eq? @_p "fmt") (#eq? @_s "Sprintf")))
   ])
-  (#any-of? @_m "Query" "QueryRow" "Exec" "Prepare" "Select" "Get" "Raw")) @risk.raw_sql
+  (#any-of? @_m "Query" "QueryRow" "Exec" "Prepare" "Queryx" "QueryRowx" "MustExec" "Raw")) @risk.raw_sql
 
+; the same with a leading context.Context
 (call_expression
   function: (selector_expression field: (field_identifier) @_m)
   arguments: (argument_list . (_) . [
     (binary_expression operator: "+")
     (call_expression function: (selector_expression operand: (identifier) @_p field: (field_identifier) @_s (#eq? @_p "fmt") (#eq? @_s "Sprintf")))
   ])
-  (#any-of? @_m "QueryContext" "QueryRowContext" "ExecContext" "PrepareContext" "SelectContext" "GetContext")) @risk.raw_sql
+  (#any-of? @_m "QueryContext" "QueryRowContext" "ExecContext" "PrepareContext" "QueryxContext" "QueryRowxContext" "MustExecContext")) @risk.raw_sql
+
+; sqlx Get/Select(&dest, query, ...): the `&dest` keeps redis/gin/http `Get` calls out
+(call_expression
+  function: (selector_expression field: (field_identifier) @_m)
+  arguments: (argument_list . (unary_expression operator: "&") . [
+    (binary_expression operator: "+")
+    (call_expression function: (selector_expression operand: (identifier) @_p field: (field_identifier) @_s (#eq? @_p "fmt") (#eq? @_s "Sprintf")))
+  ])
+  (#any-of? @_m "Get" "Select")) @risk.raw_sql
+
+; sqlx GetContext/SelectContext(ctx, &dest, query, ...)
+(call_expression
+  function: (selector_expression field: (field_identifier) @_m)
+  arguments: (argument_list . (_) . (unary_expression operator: "&") . [
+    (binary_expression operator: "+")
+    (call_expression function: (selector_expression operand: (identifier) @_p field: (field_identifier) @_s (#eq? @_p "fmt") (#eq? @_s "Sprintf")))
+  ])
+  (#any-of? @_m "GetContext" "SelectContext")) @risk.raw_sql
 
 (go_statement) @risk.concurrency
 (channel_type) @risk.concurrency
