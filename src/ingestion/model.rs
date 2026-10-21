@@ -106,6 +106,8 @@ pub enum TypeExpr {
     Key(Box<TypeExpr>),
     /// A later result of a multi-value call: `w` in `r, w := io.Pipe()` is `Result(io.Pipe, 1)`.
     Result(Box<TypeExpr>, usize),
+    /// Any of these (Ruby branch results: `@x || Foo.new`, `if a then B.new else C.new end`).
+    Union(Vec<TypeExpr>),
     /// The positional parameter at this index of the named method (of the enclosing class), typed
     /// by the linker from the arguments its callers pass.
     Param(String, usize),
@@ -127,6 +129,9 @@ pub struct TypeFacts {
     pub vars: Vec<(String, TypeExpr)>,
     /// Go: (receiver type or "", function, positional index, declared type) of each parameter.
     pub params: Vec<(String, String, usize, String)>,
+    /// Ruby: (class, @ivar, element) for values put into an instance-variable collection
+    /// (`@x << v`, `push`, `@x[k] = v`, `@x = [v]`); `None` for an untyped element.
+    pub elems: Vec<(String, String, Option<TypeExpr>)>,
     /// Go `//go:build` constraint expression, if the file has one.
     pub build_constraint: Option<String>,
     /// (class, method) for methods that exist without a `def`: Ruby accessors, `Struct` members,

@@ -322,17 +322,33 @@ fn extract_calls(
         let line = anchor.start_position().row + 1;
 
         if let (Some(site), Some(target)) = (cap("call.site"), cap("call.target_name")) {
+            // `x.foo = v` (Ruby) calls the setter `foo=` with `v`, not the reader `foo`
+            let setter = site
+                .parent()
+                .filter(|p| {
+                    p.kind() == "assignment" && p.child_by_field_name("left").is_some_and(|l| l.id() == site.id())
+                })
+                .and_then(|p| p.child_by_field_name("right"));
             out.calls.push(CallSite {
                 from_symbol_id: from,
-                target_name: text(target, src).to_string(),
+                target_name: match setter {
+                    Some(_) => format!("{}=", text(target, src)),
+                    None => text(target, src).to_string(),
+                },
                 receiver: cap("call.receiver").map(|r| snippet(r, src)),
                 line,
-                snippet: snippet(site, src),
+                snippet: snippet(site.parent().filter(|_| setter.is_some()).unwrap_or(site), src),
                 kind: CallKind::Direct,
                 via: None,
                 receiver_type: cap("call.receiver").and_then(|r| fe.receiver_type(r, src)),
-                args: fe.call_args(site, src),
-                arg_types: fe.call_arg_types(site, src),
+                args: match setter {
+                    Some(_) => Some(CallArgs { positional: 1, keywords: false }),
+                    None => fe.call_args(site, src),
+                },
+                arg_types: match setter {
+                    Some(v) => vec![fe.receiver_type(v, src)],
+                    None => fe.call_arg_types(site, src),
+                },
             });
         } else if let Some(r) = cap("call.callback_ref") {
             // `Self::handler`, `self.handler`, `mod.handler` carry a qualifier; a bare `handler`

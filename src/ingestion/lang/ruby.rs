@@ -300,14 +300,29 @@ impl Frontend for RubyFrontend {
             {
                 accessor_methods(&class_qn(n), &members, true, &mut facts.methods);
             }
+            // elements put into instance-variable collections
+            if let Some(class) = enclosing_type(n)
+                && let Some((target, values)) = collection_puts(n, src)
+                && target.kind() == "instance_variable"
+            {
+                let qn = class_qn(class);
+                for v in values {
+                    facts.elems.push((qn.clone(), text(target, src).to_string(), expr_type(v, src, 0)));
+                }
+            }
+            if matches!(n.kind(), "assignment" | "operator_assignment")
+                && let Some(class) = enclosing_type(n)
+                && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
+                && l.kind() == "instance_variable"
+                && !fresh_collection(r, src)
+            {
+                facts.elems.push((class_qn(class), text(l, src).to_string(), None));
+            }
             // a method's result: its last expression, when that has a known type
             if matches!(n.kind(), "method" | "singleton_method")
                 && let Some(class) = enclosing_type(n)
                 && let Some(name) = n.child_by_field_name("name")
-                && let Some(last) = n.child_by_field_name("body").and_then(|b| {
-                    named_kids(b).into_iter().rfind(|c| !matches!(c.kind(), "rescue" | "else" | "ensure"))
-                })
-                && let Some(t) = expr_type(last, src, 0)
+                && let Some(t) = method_result(n, src)
             {
                 facts.results.push((class_qn(class), text(name, src).to_string(), t));
             }
@@ -345,10 +360,13 @@ impl Frontend for RubyFrontend {
                 && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
                 && l.kind() == "instance_variable"
                 && let Some(class) = enclosing_type(n)
-                && let Some(t) = expr_type(r, src, 0)
-                && t != TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), text(l, src).to_string())
+                && r.kind() != "nil"
             {
-                facts.fields.push((class_qn(class), text(l, src).to_string(), t));
+                // an untyped assignment (`?`) makes the variable's type unknown
+                let t = expr_type(r, src, 0).unwrap_or_else(|| TypeExpr::Named("?".to_string()));
+                if t != TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), text(l, src).to_string()) {
+                    facts.fields.push((class_qn(class), text(l, src).to_string(), t));
+                }
             }
             true
         });
@@ -448,6 +466,13 @@ fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
         }
         "parenthesized_statements" => expr_type(n.named_child(0)?, src, depth + 1),
         "constant" | "scope_resolution" => Some(TypeExpr::Ident(text(n, src).to_string())),
+        "if" | "unless" | "case" | "conditional" | "begin" => common_type(&[n], src),
+        "binary"
+            if n.child_by_field_name("operator")
+                .is_some_and(|o| matches!(text(o, src), "||" | "or" | "&&" | "and")) =>
+        {
+            common_type(&[n], src)
+        }
         "operator_assignment" | "assignment" => expr_type(n.child_by_field_name("right")?, src, depth + 1),
         "call" => {
             let method = text(n.child_by_field_name("method")?, src);
@@ -473,6 +498,240 @@ fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
     }
 }
 
+/// A method's result type, when its last expression and every `return` agree (`nil` results
+/// don't count against it: they answer no methods anyway).
+fn method_result(method: Node, src: &[u8]) -> Option<TypeExpr> {
+    let body = method.child_by_field_name("body")?;
+    let last = named_kids(body).into_iter().rfind(|c| !matches!(c.kind(), "rescue" | "else" | "ensure"))?;
+    let mut values = vec![last];
+    crate::ingestion::parser::walk(body, |n| {
+        if matches!(n.kind(), "method" | "singleton_method" | "class" | "module" | "lambda") {
+            return false;
+        }
+        if n.kind() == "return"
+            && let Some(v) = n.named_child(0).and_then(|a| named_kids(a).into_iter().next())
+        {
+            values.push(v);
+        }
+        true
+    });
+    common_type(&values, src)
+}
+
+/// The types `values` can have (looking through branches), ignoring `nil`s: one type, or a
+/// `Union` of them. `None` when any is untyped.
+fn common_type(values: &[Node], src: &[u8]) -> Option<TypeExpr> {
+    let mut found: Vec<TypeExpr> = Vec::new();
+    for v in values {
+        for leaf in branch_results(*v, src) {
+            if leaf.kind() == "nil" {
+                continue;
+            }
+            let t = expr_type(leaf, src, 0)?;
+            if !found.contains(&t) {
+                found.push(t);
+            }
+        }
+    }
+    match found.len() {
+        0 => None,
+        1 => found.pop(),
+        _ => Some(TypeExpr::Union(found)),
+    }
+}
+
+/// The expressions a value can come from: both branches of `if`/`unless`/ternaries and `case`,
+/// both sides of `a || b`, the last statement of a `begin` or parenthesized block.
+fn branch_results<'t>(n: Node<'t>, src: &[u8]) -> Vec<Node<'t>> {
+    let last = |b: Node<'t>| {
+        named_kids(b).into_iter().rfind(|c| !matches!(c.kind(), "rescue" | "else" | "ensure" | "comment"))
+    };
+    match n.kind() {
+        "if" | "unless" | "elsif" => {
+            let mut out = Vec::new();
+            for f in ["consequence", "alternative"] {
+                match n.child_by_field_name(f) {
+                    Some(b) if matches!(b.kind(), "elsif" | "if") => out.extend(branch_results(b, src)),
+                    Some(b) => out.extend(last(b).map(|l| branch_results(l, src)).unwrap_or_default()),
+                    // a missing branch is `nil`
+                    None => {}
+                }
+            }
+            out
+        }
+        "conditional" => ["consequence", "alternative"]
+            .into_iter()
+            .filter_map(|f| n.child_by_field_name(f))
+            .flat_map(|b| branch_results(b, src))
+            .collect(),
+        "case" => named_kids(n)
+            .into_iter()
+            .filter(|c| matches!(c.kind(), "when" | "else"))
+            .filter_map(|c| if c.kind() == "else" { last(c) } else { c.child_by_field_name("body").and_then(last) })
+            .flat_map(|l| branch_results(l, src))
+            .collect(),
+        "binary" if n.child_by_field_name("operator").is_some_and(|o| matches!(text(o, src), "||" | "or")) => {
+            ["left", "right"]
+                .into_iter()
+                .filter_map(|f| n.child_by_field_name(f))
+                .flat_map(|b| branch_results(b, src))
+                .collect()
+        }
+        // `a && b` is `b` (or a falsy `a`, which answers nothing)
+        "binary" if n.child_by_field_name("operator").is_some_and(|o| matches!(text(o, src), "&&" | "and")) => {
+            n.child_by_field_name("right").map(|r| branch_results(r, src)).unwrap_or_default()
+        }
+        "begin" | "parenthesized_statements" => last(n).map(|l| branch_results(l, src)).unwrap_or_default(),
+        _ => vec![n],
+    }
+}
+
+/// Iterators whose block's first parameter is an element of the receiver.
+const ITERATORS: &[&str] = &[
+    "each",
+    "map",
+    "collect",
+    "flat_map",
+    "select",
+    "filter",
+    "filter_map",
+    "reject",
+    "find",
+    "detect",
+    "find_all",
+    "any?",
+    "all?",
+    "none?",
+    "one?",
+    "count",
+    "sort_by",
+    "min_by",
+    "max_by",
+    "group_by",
+    "partition",
+    "sum",
+    "take_while",
+    "drop_while",
+    "each_with_index",
+    "each_with_object",
+    "map!",
+    "select!",
+    "reject!",
+    "sort_by!",
+    "uniq",
+    "each_value",
+    "find_index",
+    "index",
+    "delete_if",
+    "keep_if",
+    "tally_by",
+    "chunk_while",
+];
+
+/// `xs.each { |x| }` (and `sort { |a, b| }`, `inject { |acc, x| }`): a block parameter that receives
+/// the receiver's elements is typed as such; any other block parameter is untyped.
+fn block_param_type(block: Node, k: usize, n: usize, src: &[u8], depth: u8) -> Option<TypeExpr> {
+    let call = block
+        .parent()
+        .filter(|c| c.kind() == "call" && c.child_by_field_name("block").is_some_and(|b| b.id() == block.id()))?;
+    let method = text(call.child_by_field_name("method")?, src);
+    let elem_param = match method {
+        "sort" | "sort!" | "max" | "min" | "minmax" => k < 2,
+        "inject" | "reduce" => k == 1 && n == 2,
+        m if ITERATORS.contains(&m) => k == 0 && (n == 1 || matches!(m, "each_with_index" | "each_with_object")),
+        _ => false,
+    };
+    if !elem_param {
+        return None;
+    }
+    let receiver = call.child_by_field_name("receiver")?;
+    // a local collection filled in this method: its elements' type, when they agree
+    if receiver.kind() == "identifier"
+        && let Some(t) = local_elem_type(receiver, src, depth)
+    {
+        return Some(t);
+    }
+    Some(TypeExpr::Elem(Box::new(expr_type(receiver, src, depth + 1)?)))
+}
+
+/// The common type of what a method puts into local collection `ident` (`xs << v`, `xs.push(v)`,
+/// `xs = [v]`), when every such value has the same known type.
+fn local_elem_type(ident: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
+    let name = text(ident, src);
+    let mut method = ident.parent();
+    while let Some(m) = method.filter(|m| !matches!(m.kind(), "method" | "singleton_method")) {
+        method = m.parent();
+    }
+    let mut found: Option<Option<TypeExpr>> = None;
+    let mut add = |t: Option<TypeExpr>| match &found {
+        None => found = Some(t),
+        Some(prev) if *prev != t => found = Some(None),
+        _ => {}
+    };
+    crate::ingestion::parser::walk(method?, |n| {
+        if let Some((target, values)) = collection_puts(n, src)
+            && target.kind() == "identifier"
+            && text(target, src) == name
+        {
+            for v in values {
+                add(expr_type(v, src, depth + 1));
+            }
+        }
+        // assigned something other than a fresh collection: elements we don't see
+        if matches!(n.kind(), "assignment" | "operator_assignment")
+            && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
+            && l.kind() == "identifier"
+            && text(l, src) == name
+            && !fresh_collection(r, src)
+        {
+            add(None);
+        }
+        true
+    });
+    found.flatten()
+}
+
+/// Whether `n` makes a fresh collection whose elements are only what is later put into it:
+/// `[]`/`{}` literals (their own elements count as puts) and `Array.new`/`Hash.new`/`Set.new`.
+fn fresh_collection(n: Node, src: &[u8]) -> bool {
+    match n.kind() {
+        "array" | "hash" => true,
+        "call" => {
+            n.child_by_field_name("receiver").is_some_and(|r| matches!(text(r, src), "Array" | "Hash" | "Set"))
+                && n.child_by_field_name("method").is_some_and(|m| text(m, src) == "new")
+                && n.child_by_field_name("arguments").is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The collection node `n` puts values into (`xs << v`, `xs.push(v)`, `xs[k] = v`, `xs = [v]`),
+/// and those values.
+fn collection_puts<'t>(n: Node<'t>, src: &[u8]) -> Option<(Node<'t>, Vec<Node<'t>>)> {
+    match n.kind() {
+        "binary" if n.child_by_field_name("operator").is_some_and(|o| text(o, src) == "<<") => {
+            Some((n.child_by_field_name("left")?, vec![n.child_by_field_name("right")?]))
+        }
+        "call" => {
+            let m = n.child_by_field_name("method").map_or("", |m| text(m, src));
+            matches!(m, "push" | "unshift" | "append" | "prepend" | "add" | "<<").then_some(())?;
+            Some((
+                n.child_by_field_name("receiver")?,
+                n.child_by_field_name("arguments").map(named_kids).unwrap_or_default(),
+            ))
+        }
+        "assignment" => {
+            let (l, r) = (n.child_by_field_name("left")?, n.child_by_field_name("right")?);
+            match l.kind() {
+                "element_reference" => Some((l.child_by_field_name("object")?, vec![r])),
+                _ if r.kind() == "array" => Some((l, named_kids(r))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn self_call(method: &str) -> TypeExpr {
     TypeExpr::Call(Box::new(TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), method.to_string())))
 }
@@ -487,9 +746,9 @@ fn local_binding(ident: Node, src: &[u8], depth: u8) -> Option<Option<TypeExpr>>
     while let Some(n) = cur {
         match n.kind() {
             "block" | "do_block" | "lambda" => {
-                let params = n.child_by_field_name("parameters");
-                if params.is_some_and(|p| param_names(p, src).iter().any(|p| p == name)) {
-                    return Some(None);
+                let params = n.child_by_field_name("parameters").map(|p| param_names(p, src)).unwrap_or_default();
+                if let Some(k) = params.iter().position(|p| p == name) {
+                    return Some(block_param_type(n, k, params.len(), src, depth));
                 }
             }
             "method" | "singleton_method" => {
