@@ -3,13 +3,15 @@
 
     atlas_call.py <repo> <tool> [json-arguments | @file.json]
     atlas_call.py <repo> prompt:<name> [json-arguments]     # e.g. prompt:cartographer_prompt
+    atlas_call.py <repo> tools                               # list the tools and their input schemas
 
 Starts the server on <repo>, performs the MCP handshake, calls the tool, prints its text result
 and exits: 0 on success, 2 when the tool reports an error (e.g. a validation failure), 1 on a
 protocol error. State persists in <repo>/.code_atlas/ between calls; run one call at a time.
 
 The binary is $CODE_ATLAS_BIN, else `code-atlas-mcp` on PATH. Set CODE_ATLAS_EMBEDDER=hash to
-avoid downloading the embedding model.
+avoid downloading the embedding model. With ATLAS_CALL_LOG set, each call is appended to that file
+as a JSON line ({"tool": ..., "arguments": ..., "exit": ...}).
 """
 import json
 import os
@@ -50,6 +52,14 @@ def main():
                      "clientInfo": {"name": "atlas_call", "version": "1"}}})
     recv(1)
     send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    if tool == "tools":
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        res = recv(2)
+        proc.stdin.close()
+        proc.wait(timeout=120)
+        for t in res["result"]["tools"]:
+            print(f"## {t['name']}\n{t.get('description', '')}\n```json\n{json.dumps(t.get('inputSchema', {}), indent=1)}\n```\n")
+        return
     if tool.startswith("prompt:"):
         send({"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
               "params": {"name": tool[len("prompt:"):], "arguments": args}})
@@ -59,6 +69,10 @@ def main():
     proc.stdin.close()
     proc.wait(timeout=120)
 
+    code = 1 if "error" in res else 2 if res["result"].get("isError") else 0
+    if os.environ.get("ATLAS_CALL_LOG"):
+        with open(os.environ["ATLAS_CALL_LOG"], "a") as log:
+            log.write(json.dumps({"tool": tool, "arguments": args, "exit": code}) + "\n")
     if "error" in res:
         print(json.dumps(res["error"], indent=2))
         sys.exit(1)

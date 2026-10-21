@@ -5,7 +5,9 @@
       "id": 1,
       "prompt": "The code-atlas server is set up on evals/testdata/notes-app. Map the whole repo into it so an auditor can use it later.",
       "expected_output": "A complete atlas of the notes app: every callable symbol mapped, guessed edges resolved, a rollup for app/ and a flow per route, followed by a short coverage and risk report.",
-      "files": ["evals/testdata/notes-app"],
+      "files": [
+        "evals/testdata/notes-app"
+      ],
       "assertions": [
         "get_macro_atlas reports 20/20 callable symbols mapped, 0 stale, 0 unverified heuristic edges",
         "NoteRepo.search has a strict contract with trust_boundary true and risk_score >= 8, and its edge to Database.query has data_taint_propagated",
@@ -22,7 +24,9 @@
       "id": 2,
       "prompt": "We only care about session handling right now. Put just the auth code of evals/testdata/notes-app into the atlas, nothing else.",
       "expected_output": "Only app/auth.py is mapped (scope_path_prefix), with strict contracts on parse_bearer, verify_token and current_user, and the user is told the rest is unmapped.",
-      "files": ["evals/testdata/notes-app"],
+      "files": [
+        "evals/testdata/notes-app"
+      ],
       "assertions": [
         "every get_next_cartography_batch call passes scope_path_prefix app/auth.py (or app/auth)",
         "no symbol outside app/auth.py is submitted",
@@ -34,10 +38,13 @@
       "id": 3,
       "prompt": "I just fixed the SQL in NoteRepo.search to use bound parameters. Bring the atlas for evals/testdata/notes-app up to date.",
       "expected_output": "A sync, re-mapping of the stale symbols with the injection no longer claimed, and the note_search flow re-recorded.",
-      "files": ["evals/testdata/notes-app"],
+      "files": [
+        "evals/testdata/notes-app"
+      ],
       "assertions": [
         "sync_repository_skeleton is called before any batch",
         "NoteRepo.search is re-submitted and its contract no longer claims SQL injection",
+        "the callers NoteService.search_notes and search (route) are re-submitted so they no longer claim a SQL injection",
         "flow::note_search is re-recorded with updated critical assumptions",
         "get_macro_atlas reports 0 stale symbols at the end"
       ]
