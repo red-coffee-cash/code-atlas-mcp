@@ -1,0 +1,72 @@
+{
+  "skill_name": "code-atlas-cartographer",
+  "fixtures": {
+    "shop-app": "evals/testdata/shop-app (fresh)",
+    "shop-continue": "shop-app with 13 leaf models from an 'earlier session', two of them wrong: escape_html claims to escape all five HTML characters, safe_next claims to prevent open redirects (built by evals/build_states.py)",
+    "shop-regression": "shop-app with the webhook path mapped and flow::payment_webhook recorded, then verify_signature changed to accept a missing header, not yet synced (built by evals/build_states.py)"
+  },
+  "evals": [
+    {
+      "id": 1,
+      "name": "shop-full-map",
+      "fixture": "shop-app",
+      "prompt": "code-atlas is set up on {repo}. Map the whole repo into it so an auditor can use it later.",
+      "expected_output": "Every callable mapped, the dispatch table's hidden edges added, the wrong exact edge pruned, end-to-end taint from the routes to the sinks, the plain-looking leaves (safe_next, escape_html) and the ignored user_id in checkout recorded, a self-check before reporting, findings framed as hypotheses.",
+      "assertions": [
+        "get_macro_atlas reports 31/31 callable symbols mapped, 0 stale, 0 unverified heuristic edges",
+        "the STATIC_EXACT edge Db.query -> Db.execute is pruned (self.conn.execute is sqlite3)",
+        "handle_webhook has LLM_VERIFIED edges to handle_refund and handle_payment_succeeded (dispatch through HANDLERS)",
+        "trace_connective_paths TAINT finds a path from payments_webhook to RefundRepo.save",
+        "safe_next has a strict contract with trust_boundary true that records the '//host' (protocol-relative) open redirect",
+        "escape_html's contract records that only '<' is escaped",
+        "OrderService.checkout's contract records that user_id is never used (no ownership check on the order)",
+        "trace_connective_paths TAINT finds a path from the checkout route to escape_html",
+        "after its last submit_symbol_models the run calls query_audit_surface or semantic_atlas_search (self-check)",
+        "the final message presents the risks as hypotheses for an auditor, not as confirmed bugs"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "shop-continue",
+      "fixture": "shop-continue",
+      "prompt": "A colleague started mapping {repo} into the atlas last week. Finish it.",
+      "expected_output": "The queue finished, and the colleague's wrong escape_html and safe_next models corrected rather than built upon.",
+      "assertions": [
+        "escape_html is re-submitted and its contract no longer claims all five characters are escaped (it records that only '<' is)",
+        "safe_next is re-submitted as a strict contract with trust_boundary true that records the '//host' open redirect",
+        "render_receipt's model does not describe the note as safely escaped (it records the incomplete escaping / XSS)",
+        "get_macro_atlas reports 31/31 mapped and 0 unverified heuristic edges",
+        "the final message tells the user that earlier models were wrong and were corrected"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "shop-regression-refresh",
+      "fixture": "shop-regression",
+      "prompt": "I refactored verify_signature in shop/payments/webhook.py so our legacy payment provider keeps working. Bring the atlas for {repo} up to date.",
+      "expected_output": "verify_signature re-mapped as accepting unsigned webhooks, and every model and flow that still promises 'unsigned events are rejected' corrected: handle_webhook, the route, the handlers, flow::payment_webhook.",
+      "assertions": [
+        "verify_signature is re-submitted with risk_score >= 7 and its contract records that a missing header is accepted",
+        "handle_webhook is re-submitted and no longer claims unsigned events are rejected (records the missing-header bypass)",
+        "payments_webhook (the route) is re-submitted",
+        "handle_refund or handle_payment_succeeded is re-submitted noting that unsigned events now reach it",
+        "flow::payment_webhook is re-recorded and mentions the missing-header bypass",
+        "get_macro_atlas reports 0 stale symbols at the end",
+        "the final message flags the change as a likely security regression to review, not just as an atlas update"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "shop-webhook-priority",
+      "fixture": "shop-app",
+      "prompt": "We only have time today for the payment webhook. Put what an auditor needs for it into the atlas for {repo}, and skip the rest.",
+      "expected_output": "The webhook cone mapped, including the handlers only reachable through the HANDLERS dispatch table, nothing unrelated mapped, and a webhook flow that reaches a handler.",
+      "assertions": [
+        "handle_refund and handle_payment_succeeded have strict contracts and handle_webhook has LLM_VERIFIED edges to both",
+        "no symbol of login, checkout, admin_export, export_orders, render_receipt, safe_next, check_password, apply_discount or OrderService.checkout is submitted",
+        "a flow is recorded whose entrypoint is payments_webhook and whose steps include handle_refund or handle_payment_succeeded",
+        "the final message states that only the webhook path is covered"
+      ]
+    }
+  ]
+}

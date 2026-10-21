@@ -74,6 +74,28 @@ Prompts: `cartographer_prompt` and `auditor_prompt` are operating manuals for th
 Typical session: run the Cartographer prompt (`sync_repository_skeleton`, then loop batch/submit,
 rollups, flows), then the Auditor prompt.
 
+### Cartographer skill
+
+[`skills/code-atlas-cartographer/`](skills/code-atlas-cartographer/SKILL.md) is an agent skill for
+the Producer role. It covers:
+- **Orientation**: survey entrypoints, untrusted inputs and sinks before the bottom-up queue starts.
+- **The mapping loop**: light vs strict models, edge verdicts (wrong exact edges included), taint marking.
+- **Rollups and flows.**
+- **Refreshes after code changes**, including the callers whose contracts go out of date.
+- **A final self-check** with the auditor's own queries.
+
+Its references give the exact payload schemas, the server's validation rules, and a worked example
+taken from a real run.
+
+Install it where your agent looks for skills:
+- **Claude Code**: copy or symlink the directory to `~/.claude/skills/` (all projects) or to
+  `.claude/skills/` in the repository you are mapping.
+- **Server built but not registered**: `scripts/atlas_call.py` drives it one tool call at a time.
+
+`python3 skills/code-atlas-cartographer/evals/check_examples.py` (with `CODE_ATLAS_BIN` pointing at the
+binary) replays every example payload against a fresh sync of the bundled `notes-app` fixture. Run it
+after changing tool arguments or validation, so the skill stays accurate.
+
 ## Notes and deviations from the spec
 
 * **Dependency versions** differ from the spec's guesses (`rmcp` 3.6, `fastembed` 7, `petgraph` 0.8,
