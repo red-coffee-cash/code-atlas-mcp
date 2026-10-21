@@ -132,6 +132,19 @@ impl Frontend for GoFrontend {
         expr_type(receiver, src, 0)
     }
 
+    fn call_arg_types(&self, site: Node, src: &[u8]) -> Vec<Option<TypeExpr>> {
+        let Some(args) = site.child_by_field_name("arguments") else { return Vec::new() };
+        let mut out = Vec::new();
+        for a in named(args) {
+            if a.kind() == "variadic_argument" {
+                out.push(None);
+                break;
+            }
+            out.push(expr_type(a, src, 0));
+        }
+        out
+    }
+
     fn type_facts(&self, root: Node, src: &[u8]) -> TypeFacts {
         let mut facts = TypeFacts::default();
         let mut cursor = root.walk();
@@ -154,6 +167,17 @@ impl Frontend for GoFrontend {
                 }
                 "function_declaration" | "method_declaration" => {
                     let owner = receiver_type(decl, src).unwrap_or_default();
+                    if let Some(name) = decl.child_by_field_name("name") {
+                        let mut i = 0;
+                        for p in decl.child_by_field_name("parameters").map(named).unwrap_or_default() {
+                            let ty = p.child_by_field_name("type").map_or(String::new(), |t| text(t, src).to_string());
+                            let n = p.children_by_field_name("name", &mut p.walk()).count().max(1);
+                            for _ in 0..n {
+                                facts.params.push((owner.clone(), text(name, src).to_string(), i, ty.clone()));
+                                i += 1;
+                            }
+                        }
+                    }
                     if let (Some(name), Some(_), Some(body)) = (
                         decl.child_by_field_name("name"),
                         decl.child_by_field_name("result"),
@@ -169,18 +193,7 @@ impl Frontend for GoFrontend {
                     else {
                         continue;
                     };
-                    let first = if result.kind() == "parameter_list" {
-                        result.named_child(0).and_then(|p| p.child_by_field_name("type"))
-                    } else {
-                        Some(result)
-                    };
-                    if let Some(t) = first {
-                        facts.results.push((
-                            owner,
-                            text(name, src).to_string(),
-                            TypeExpr::Named(text(t, src).to_string()),
-                        ));
-                    }
+                    record_results(&owner, text(name, src), result, src, &mut facts);
                 }
                 "var_declaration" => {
                     let mut c = decl.walk();
@@ -251,6 +264,26 @@ fn named(n: Node) -> Vec<Node> {
     n.named_children(&mut c).filter(|x| x.kind() != "comment").collect()
 }
 
+/// Each result's type: `f` for the first, `f#1`, `f#2`, ... for the rest.
+fn record_results(owner: &str, name: &str, result: Node, src: &[u8], facts: &mut TypeFacts) {
+    let types: Vec<String> = if result.kind() == "parameter_list" {
+        named(result)
+            .into_iter()
+            .filter_map(|p| {
+                let t = text(p.child_by_field_name("type")?, src).to_string();
+                Some(std::iter::repeat_n(t, p.children_by_field_name("name", &mut p.walk()).count().max(1)))
+            })
+            .flatten()
+            .collect()
+    } else {
+        vec![text(result, src).to_string()]
+    };
+    for (i, t) in types.into_iter().enumerate() {
+        let key = if i == 0 { name.to_string() } else { format!("{name}#{i}") };
+        facts.results.push((owner.to_string(), key, TypeExpr::Named(t)));
+    }
+}
+
 fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
     match ty.kind() {
         "struct_type" => {
@@ -283,15 +316,8 @@ fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
                     "method_elem" => {
                         if let Some(n) = m.child_by_field_name("name") {
                             facts.iface_methods.push((name.to_string(), text(n, src).to_string()));
-                            if let Some(t) = m.child_by_field_name("result").and_then(|r| {
-                                if r.kind() == "parameter_list" {
-                                    r.named_child(0)?.child_by_field_name("type")
-                                } else {
-                                    Some(r)
-                                }
-                            }) {
-                                let result = TypeExpr::Named(text(t, src).to_string());
-                                facts.results.push((name.to_string(), text(n, src).to_string(), result));
+                            if let Some(r) = m.child_by_field_name("result") {
+                                record_results(name, text(n, src), r, src, facts);
                             }
                         }
                     }
@@ -399,6 +425,13 @@ fn local_func_literal<'t>(ident: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
 /// Everything assigned to local `name` in `func` (named results included: they start as zero
 /// values). `None` for parameters, whose values come from callers.
 fn assigned_values(func: Node, name: &str, src: &[u8]) -> Option<Vec<TypeExpr>> {
+    if matches!(func.kind(), "function_declaration" | "method_declaration")
+        && let Some(i) = param_index(func, name, src)
+    {
+        let owner = receiver_type(func, src).unwrap_or_default();
+        let f = func.child_by_field_name("name").map_or("", |n| text(n, src));
+        return Some(vec![TypeExpr::Param(format!("{owner}.{f}"), i)]);
+    }
     let is_param = ["receiver", "parameters"]
         .into_iter()
         .filter_map(|f| func.child_by_field_name(f))
@@ -655,6 +688,13 @@ fn binding(ident: Node, src: &[u8], depth: u8) -> Binding {
                         Binding::Untyped
                     })
                 }),
+            // a parameter of a named function: typed (and possibly narrowed) by the linker from its
+            // callers' arguments; `Param("Owner.func", i)`
+            "function_declaration" | "method_declaration" if let Some(i) = param_index(scope, name, src) => {
+                let owner = receiver_type(scope, src).unwrap_or_default();
+                let func = scope.child_by_field_name("name").map_or("", |n| text(n, src));
+                Some(Binding::Typed(TypeExpr::Param(format!("{owner}.{func}"), i)))
+            }
             "function_declaration" | "method_declaration" | "func_literal" => {
                 let lists =
                     ["receiver", "parameters", "result"].into_iter().filter_map(|f| scope.child_by_field_name(f));
@@ -681,6 +721,24 @@ fn binding(ident: Node, src: &[u8], depth: u8) -> Binding {
     Binding::Unbound
 }
 
+/// The positional index of non-variadic parameter `name` of a function declaration.
+fn param_index(func: Node, name: &str, src: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    for p in func.child_by_field_name("parameters").map(named).unwrap_or_default() {
+        let names: Vec<Node> = p.children_by_field_name("name", &mut p.walk()).collect();
+        for n in &names {
+            if text(*n, src) == name {
+                return (p.kind() == "parameter_declaration").then_some(i);
+            }
+            i += 1;
+        }
+        if names.is_empty() {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// What `decl` says about `name`, if it declares it.
 fn declares(decl: Node, name: &str, src: &[u8], depth: u8) -> Option<Binding> {
     let typed = |t: Option<TypeExpr>| Some(t.map_or(Binding::Untyped, Binding::Typed));
@@ -691,9 +749,15 @@ fn declares(decl: Node, name: &str, src: &[u8], depth: u8) -> Option<Binding> {
             let i = left.iter().position(|l| text(*l, src) == name)?;
             match (right.len() == left.len(), i) {
                 (true, _) => typed(expr_type(right[i], src, depth)),
-                // `v, err := f()` / `v, ok := m[k]`: only the first value's type is known
+                // `v, err := f()` / `v, ok := m[k]`: the first value is the expression's own type;
+                // later values of a call are its later results
                 (false, 0) => typed(right.first().and_then(|r| expr_type(*r, src, depth))),
-                _ => Some(Binding::Untyped),
+                (false, i) => typed(right.first().filter(|r| r.kind() == "call_expression").and_then(|r| {
+                    match expr_type(*r, src, depth)? {
+                        TypeExpr::Call(callee) => Some(TypeExpr::Result(callee, i)),
+                        _ => None,
+                    }
+                })),
             }
         }
         "range_clause" => {

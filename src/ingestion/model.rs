@@ -104,6 +104,8 @@ pub enum TypeExpr {
     Elem(Box<TypeExpr>),
     /// The first variable of `range xs`: an index, a map key, or a channel's element.
     Key(Box<TypeExpr>),
+    /// A later result of a multi-value call: `w` in `r, w := io.Pipe()` is `Result(io.Pipe, 1)`.
+    Result(Box<TypeExpr>, usize),
     /// The positional parameter at this index of the named method (of the enclosing class), typed
     /// by the linker from the arguments its callers pass.
     Param(String, usize),
@@ -118,10 +120,13 @@ pub struct TypeFacts {
     pub embeds: Vec<(String, String)>,
     /// (interface, method) declared directly on a Go interface.
     pub iface_methods: Vec<(String, String)>,
-    /// (receiver type or class, or "" for a function; name; (first) result type).
+    /// (receiver type or class, or "" for a function; name; first result type). Go also records the
+    /// later results, as `name#1`, `name#2`, ...
     pub results: Vec<(String, String, TypeExpr)>,
     /// Package-level variables: (name, type).
     pub vars: Vec<(String, TypeExpr)>,
+    /// Go: (receiver type or "", function, positional index, declared type) of each parameter.
+    pub params: Vec<(String, String, usize, String)>,
     /// Go `//go:build` constraint expression, if the file has one.
     pub build_constraint: Option<String>,
     /// (class, method) for methods that exist without a `def`: Ruby accessors, `Struct` members,

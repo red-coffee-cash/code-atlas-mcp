@@ -602,7 +602,7 @@ fn ruby_receiver_class(
             let hit = rb.param_types.borrow().get(&(scope.to_string(), method.clone(), *i)).cloned()?;
             Some(Some(hit))
         }
-        TypeExpr::Elem(_) | TypeExpr::Key(_) => None,
+        TypeExpr::Elem(_) | TypeExpr::Key(_) | TypeExpr::Result(..) => None,
     }
 }
 
@@ -770,7 +770,13 @@ struct GoModel<'a> {
     field_flows: HashMap<&'a str, Vec<(&'a TypeExpr, Flow<'a>)>>,
     /// memo for `go_dyn_types`; `None` while being computed (a cycle) or when unknown
     dyn_cache: RefCell<HashMap<String, Option<DynTypes>>>,
+    /// (package, receiver type or "", function, index) -> declared parameter type
+    params: HashMap<GoParamSlot<'a>, (&'a str, usize)>,
+    /// parameters whose every caller passes values of known dynamic type
+    param_flows: RefCell<HashMap<(usize, String, String, usize), DynTypes>>,
 }
+
+type GoParamSlot<'a> = (usize, &'a str, &'a str, usize);
 
 /// A value flowing somewhere (`None`: untyped), with the file it is written in.
 type Flow<'a> = (Option<&'a TypeExpr>, usize);
@@ -928,6 +934,9 @@ impl<'a> GoModel<'a> {
             }
             for (name, ty) in &facts.vars {
                 m.vars.insert((p, name.as_str()), (ty, fi));
+            }
+            for (owner, func, i, ty) in &facts.params {
+                m.params.insert((p, owner.as_str(), func.as_str(), *i), (ty.as_str(), fi));
             }
             for (owner, name, value) in &facts.returns {
                 m.returns.entry((p, owner.as_str(), name.as_str())).or_default().push((value.as_ref(), fi));
@@ -1267,7 +1276,128 @@ fn go_dyn_types_uncached(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -
             let &(ty, vf) = index.go.vars.get(&(index.go.pkg[fi]?, n.as_str()))?;
             go_dyn_types(index, vf, ty, d)
         }
+        TypeExpr::Param(key, i) => {
+            let (owner, func) = key.split_once('.')?;
+            let slot = (index.go.pkg[fi]?, owner.to_string(), func.to_string(), *i);
+            index.go.param_flows.borrow().get(&slot).cloned()
+        }
         _ => None,
+    }
+}
+
+/// Types interface-typed Go parameters from the dynamic types of the arguments every resolved
+/// call passes (calls through interfaces included). A function that can also be invoked in ways
+/// the call sites don't show is left alone: one used as a value (a callback, a stored func), or
+/// a method that implements an interface method (it can be called dynamically from anywhere).
+/// Runs to a fixpoint, since a typed parameter can type the arguments it is passed on as.
+fn infer_go_params(index: &Index) {
+    let go = &index.go;
+    let interface_slots: HashSet<GoParamSlot> = go
+        .params
+        .iter()
+        .filter(|&(_, &(ty, pf))| match go_resolve_text(index, pf, ty) {
+            Some(GoType::Repo(_, _, "interface")) => true,
+            Some(GoType::External(t)) => GO_STD_INTERFACES.iter().any(|(n, _)| *n == t.trim_start_matches('*')),
+            _ => false,
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    if interface_slots.is_empty() {
+        return;
+    }
+    // functions with callers the call sites don't show
+    let mut dynamic: HashSet<(usize, String, String)> = HashSet::new();
+    let iface_names: HashSet<&str> = go
+        .iface
+        .values()
+        .flatten()
+        .copied()
+        .chain(GO_STD_INTERFACES.iter().flat_map(|(_, ms)| ms.iter().copied()))
+        .collect();
+    for (fi, file) in index.files.iter().enumerate().filter(|(_, f)| f.language == Language::Go) {
+        let Some(p) = go.pkg[fi] else { continue };
+        for s in &file.symbols {
+            if s.kind == "method" && iface_names.contains(s.name.as_str()) {
+                dynamic.insert((p, scope_of(s).to_string(), s.name.clone()));
+            }
+        }
+        let referenced = file
+            .facts
+            .field_flows
+            .iter()
+            .filter_map(|(_, _, v)| v.as_ref())
+            .chain(file.facts.vars.iter().map(|(_, t)| t))
+            .chain(file.facts.returns.iter().filter_map(|(_, _, v)| v.as_ref()));
+        for t in referenced {
+            if let TypeExpr::Ident(f) = t {
+                dynamic.insert((p, String::new(), f.clone()));
+            }
+        }
+    }
+    // only calls that can reach a function with an interface-typed parameter matter
+    let relevant: HashSet<&str> = interface_slots.iter().map(|s| s.2).collect();
+    let calls: Vec<(usize, &ParsedSymbol, &CallSite)> = index
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.language == Language::Go)
+        .flat_map(|(fi, file)| {
+            let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
+            file.calls
+                .iter()
+                .filter(|c| relevant.contains(c.target_name.as_str()))
+                .filter_map(move |c| by_id.get(c.from_symbol_id.as_str()).map(|&caller| (fi, caller, c)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut arity: HashMap<(usize, &str, &str), usize> = HashMap::new();
+    for &(p, owner, func, i) in go.params.keys() {
+        let n = arity.entry((p, owner, func)).or_default();
+        *n = (*n).max(i + 1);
+    }
+    for _ in 0..4 {
+        let mut seen: HashMap<(usize, String, String, usize), Option<DynTypes>> = HashMap::new();
+        {
+            for &(fi, caller, call) in &calls {
+                let file = &index.files[fi];
+                let Some((targets, _)) = resolve_call(index, fi, file, caller, call) else { continue };
+                for t in targets {
+                    let target = index.sym(t);
+                    let Some(tp) = go.pkg[t.0] else { continue };
+                    let owner = scope_of(target);
+                    if call.kind != CallKind::Direct {
+                        dynamic.insert((tp, owner.to_string(), target.name.clone()));
+                        continue;
+                    }
+                    for i in 0..arity.get(&(tp, owner, target.name.as_str())).copied().unwrap_or(0) {
+                        if !interface_slots.contains(&(tp, owner, target.name.as_str(), i)) {
+                            continue;
+                        }
+                        let arg = call.arg_types.get(i).cloned().flatten();
+                        let dyn_types = arg.and_then(|a| go_dyn_types(index, fi, &a, 0));
+                        let slot = (tp, owner.to_string(), target.name.clone(), i);
+                        match (seen.entry(slot).or_insert_with(|| Some(DynTypes::default())), dyn_types) {
+                            (Some(acc), Some(d)) => acc.types.extend(d.types),
+                            (slot, _) => *slot = None,
+                        }
+                    }
+                }
+            }
+        }
+        let typed: HashMap<_, _> = seen
+            .into_iter()
+            .filter(|(k, _)| !dynamic.contains(&(k.0, k.1.clone(), k.2.clone())))
+            .filter_map(|(k, v)| v.filter(|v| !v.types.is_empty()).map(|v| (k, v)))
+            .collect();
+        let changed = {
+            let old = go.param_flows.borrow();
+            old.len() != typed.len() || typed.iter().any(|(k, v)| old.get(k).is_none_or(|o| o.types != v.types))
+        };
+        *go.param_flows.borrow_mut() = typed;
+        go.dyn_cache.borrow_mut().clear();
+        if !changed {
+            return;
+        }
     }
 }
 
@@ -1424,7 +1554,36 @@ fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<Go
             GoType::Container(_, cf, RangeKey::Of(k)) => go_resolve_text(index, cf, &k),
             _ => None,
         },
-        TypeExpr::Param(..) => None, // Go parameters carry their declared types
+        TypeExpr::Result(callee, i) => {
+            let nth = |m: &str| format!("{m}#{i}");
+            match callee.as_ref() {
+                TypeExpr::Ident(f) => {
+                    let &(ty, rf) = index.go.results.get(&(p, "", nth(f).as_str()))?;
+                    go_resolve_text(index, rf, ty)
+                }
+                TypeExpr::Field(base, m) => match go_resolve(index, fi, base, d)? {
+                    GoType::Package(files) => {
+                        let Some(&f0) = files.first() else {
+                            return Some(GoType::External(format!("{m}()#{i}?")));
+                        };
+                        let &(ty, rf) = index.go.results.get(&(index.go.pkg[f0]?, "", nth(m).as_str()))?;
+                        go_resolve_text(index, rf, ty)
+                    }
+                    GoType::Repo(tp, t, _) => {
+                        let (ty, rf) = go_result(index, tp, &t, &nth(m), 0)?;
+                        go_resolve_text(index, rf, ty)
+                    }
+                    GoType::External(t) => Some(GoType::External(format!("{t}.{m}()#{i}?"))),
+                    GoType::Container(..) => None,
+                },
+                _ => None,
+            }
+        }
+        TypeExpr::Param(key, i) => {
+            let (owner, func) = key.split_once('.')?;
+            let &(ty, pf) = index.go.params.get(&(p, owner, func, *i))?;
+            go_resolve_text(index, pf, ty)
+        }
     }
 }
 
@@ -1750,6 +1909,7 @@ fn infer_ruby_params(index: &Index) {
 fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
     let mut acc = EdgeAcc { edges: BTreeMap::new() };
     let mut entrypoints = HashSet::new();
+    infer_go_params(index);
     infer_ruby_params(index);
 
     for (fi, file) in index.files.iter().enumerate() {
@@ -2328,6 +2488,35 @@ func Use(f *fake) {
         assert_eq!(to("::base::Read#"), ["STATIC_EXACT"], "through a channel of a struct embedding Conn");
         // `var any Conn = f` is a plain local: its flows are not tracked, so it is CHA over both
         assert!(to("::fake::Close#").iter().all(|c| *c == "STATIC_HEURISTIC"), "{from_use:#?}");
+    }
+
+    #[test]
+    fn go_interface_params_are_typed_from_their_callers() {
+        let src = "package p
+type Conn interface{ Close() }
+type tcp struct{}
+func (t *tcp) Close() {}
+type other struct{}
+func (o *other) Close() {}
+func serve(c Conn) { c.Close() }
+func hooked(c Conn) { c.Close() }
+var hook = hooked
+func Run() {
+\tserve(&tcp{})
+\tserve(&tcp{})
+\thooked(&tcp{})
+}
+";
+        let mut files = vec![parse_as("p/p.go", Language::Go, src)];
+        let edges = link(&mut files);
+        let calls =
+            |from: &str| edges.iter().filter(|e| e.from == id(&files, from) && e.kind == "CALLS").collect::<Vec<_>>();
+        let serve = calls("serve");
+        assert_eq!(serve.len(), 1, "every caller passes a *tcp: {serve:#?}");
+        assert!(serve[0].to.contains("::tcp::Close#"));
+        assert_eq!(serve[0].confidence, "STATIC_EXACT");
+        // `hooked` is also stored as a value, so unseen callers may pass anything: CHA
+        assert_eq!(calls("hooked").len(), 2);
     }
 
     #[test]
