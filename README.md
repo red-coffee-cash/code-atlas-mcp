@@ -86,6 +86,8 @@ rollups, flows), then the Auditor prompt.
 * `ast_blake3` hashes token *kind names*, not numeric kind ids, so hashes survive grammar upgrades.
 * Entrypoints are detected from definitions (`main`, route/CLI decorators and attributes, FFI exports)
   and from handlers passed to route-registering calls.
+* Calls, type references and `IMPLEMENTS` edges link only to definitions in the caller's own
+  language (JavaScript and TypeScript count as one); there is no cross-language linking.
 * Not implemented: the optional LSP/SCIP enrichment pass (`enrich_edges_via_lsp`), C/C++/Java
   frontends, and `MUTATES_STATE`/`READS_STATE` inference (the Cartographer can add those edges).
 
@@ -122,13 +124,25 @@ rollups, flows), then the Auditor prompt.
   classes that mix a module in, then top-level methods, never an unrelated class. `Foo.x` and
   `Foo.new` (-> `initialize`) resolve in `Foo` (class methods preferred), or to nothing when `Foo` is
   not a repo class. Receivers are typed from `Foo.new`, literals (core types), `self`/`self.class`,
-  instance variables assigned in the class, method results (last expression, `attr_reader`s), and
-  positional parameters whose every resolved caller passes the same repo class (closed-world: an
-  unseen caller could pass something else).
+  instance variables and collection elements assigned in the class, method results (last
+  expression, `attr_reader`s), and positional parameters from the arguments of every call that may
+  reach the method (closed-world; a method no call reaches has untyped parameters). A value typed as
+  a module or base class resolves through the classes below it. `def self.x`, `def Const.x` and a
+  `def` inside `class << self` are class methods.
+* Structural typing for values of unknown type: the candidate classes must answer every method
+  called on the same value (a local per binding, an `@ivar` class-wide, a method result, plus what
+  the one exact callee calls on a parameter it is passed). `respond_to?` and `is_a?` checks switch
+  this off. Only Object's methods are universal; a class below a built-in (`< Array`, `include
+  Enumerable`, a reopened `class String`, `< Struct.new(..)`) answers the core API, and one below an
+  external ancestor or with `method_missing` answers anything.
+* Builds are resolved as CRuby 3.3 on x86_64-linux: a `def` in a branch that build never takes
+  (`if RUBY_ENGINE == "jruby"`, `RUBY_VERSION < "2.7"`, `RUBY_PLATFORM =~ /mswin/`,
+  `Gem.win_platform?`) is never a call target.
 * Methods without a `def` (`attr_*`, `Struct.new` members, `alias`, `alias_method`, delegators) are
   part of the method table: they shadow ancestors and count as candidates. On a receiver of unknown
-  type, a name that more than 8 classes respond to, or that core classes define (`each`, `to_s`,
-  `fetch`, `new`, ...), is too generic to link; calls must also match the candidate's arity.
+  type, a name that more than 8 classes respond to is too generic to link, and so is a core method
+  name (`each`, `fetch`, `match`, ...) on a value nothing else shows to be a repo object; calls must
+  also match the candidate's arity.
 * Method names passed as symbols (`before_action :x`, `send(:x)`, `&:x`) are `SymbolRef` edges.
 * Not modelled: paren-less bare self-calls as call sites (`helper` alone is indistinguishable from a
   local variable), `define_method` with dynamic names, `method_missing`, `Module#prepend` ordering, and
