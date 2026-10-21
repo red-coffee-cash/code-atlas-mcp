@@ -176,7 +176,13 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
 
 /// Declaration header without the body.
 fn signature(fe: &dyn Frontend, def: Node, src: &[u8], kind: &str) -> String {
-    let end = fe.function_node(def).child_by_field_name("body").map_or(def.end_byte(), |b| b.start_byte());
+    let f = fe.function_node(def);
+    let mut end = f.child_by_field_name("body").map_or(def.end_byte(), |b| b.start_byte());
+    // a comment between the header and the body (`module M # doc`, `def f():  # note`) is not
+    // part of the declaration
+    if let Some(c) = f.children(&mut f.walk()).find(|c| c.is_extra() && c.start_byte() < end) {
+        end = c.start_byte();
+    }
     let raw = String::from_utf8_lossy(&src[def.start_byte()..end]);
     // A const/static initialiser isn't part of the declaration header; a function's default
     // parameters (`x: int = 1`) are.

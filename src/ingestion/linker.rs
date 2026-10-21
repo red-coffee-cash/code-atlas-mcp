@@ -241,10 +241,17 @@ impl<'a> Index<'a> {
         &self.files[r.0].symbols[r.1]
     }
 
-    fn candidates(&self, name: &str, kinds: &[&str]) -> Vec<SymRef> {
+    /// Definitions named `name` of one of `kinds` in files of `lang` (code calls and names only
+    /// its own language's definitions).
+    fn candidates(&self, lang: Language, name: &str, kinds: &[&str]) -> Vec<SymRef> {
         self.by_name
             .get(name)
-            .map(|v| v.iter().copied().filter(|&r| kinds.contains(&self.sym(r).kind)).collect())
+            .map(|v| {
+                v.iter()
+                    .copied()
+                    .filter(|&r| self.files[r.0].language == lang && kinds.contains(&self.sym(r).kind))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -435,7 +442,7 @@ fn resolve_generic(
     // A bare `f(..)` or bare identifier argument can only name a free function; methods need a
     // receiver or qualifier (`x.f()`, `Self::f`, `self.f`).
     let kinds: &[&str] = if call.receiver.is_none() { &["fn"] } else { CALLABLE };
-    let mut cands = index.candidates(name, kinds);
+    let mut cands = index.candidates(file.language, name, kinds);
     if file.language == Language::Go && call.receiver.is_none() {
         // An unqualified Go name is declared in the caller's own package or a dot-import.
         cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0));
@@ -496,22 +503,32 @@ fn resolve_ruby(
     // methods. `def self.x` and `def x` can coexist; when the wanted kind exists, keep only it.
     // `None`: no class in the ancestry defines it; `Some([])`: an accessor or alias (no symbol).
     let in_class = |class: &str, class_level: bool| -> Option<Vec<SymRef>> {
-        let Some(mut found) = rb.lookup(class, name) else {
+        let singleton = |r: &SymRef| is_singleton_def(&index.sym(*r).signature);
+        // the nearest definition of the call's level: `pp` on a PP instance skips `def PP.pp` for
+        // the `pp` PP mixes in (methods in `class << self` read as instance ones, hence the fallback)
+        let level = rb.walk(class, &rb.ancestors, |c| {
+            let v: Vec<SymRef> = rb
+                .methods
+                .get(&(c, name))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|r| singleton(r) == class_level)
+                .collect();
+            // an accessor (no `def`) is an instance method too
+            (!v.is_empty() || (!class_level && rb.implicit.contains(&(c, name)))).then_some(v)
+        });
+        if level.is_some() {
+            return level;
+        }
+        let Some(found) = rb.lookup(class, name) else {
             return (name == "new").then(|| rb.lookup(class, "initialize").unwrap_or_default());
         };
-        let singleton = |r: &SymRef| index.sym(*r).signature.starts_with("def self.");
-        let wanted: Vec<SymRef> = found.iter().copied().filter(|r| singleton(r) == class_level).collect();
-        if !wanted.is_empty() {
-            found = wanted;
-        }
         Some(found)
     };
     // a class-body DSL call takes symbols naming instance methods (`before_action :x`)
-    let self_level = if caller.kind == "class" {
-        call.kind != CallKind::SymbolRef
-    } else {
-        caller.signature.starts_with("def self.")
-    };
+    let self_level =
+        if caller.kind == "class" { call.kind != CallKind::SymbolRef } else { is_singleton_def(&caller.signature) };
     match call.receiver.as_deref().map(str::trim) {
         // A self call: the caller's class and its ancestors, then (for a module or a base class)
         // the classes that mix it in or extend it, then top-level methods, which are private
@@ -526,11 +543,7 @@ fn resolve_ruby(
                     return Some(decide(below, Tier::Heuristic));
                 }
             }
-            let top: Vec<SymRef> = index
-                .candidates(name, &["fn"])
-                .into_iter()
-                .filter(|r| index.files[r.0].language == Language::Ruby)
-                .collect();
+            let top: Vec<SymRef> = index.candidates(Language::Ruby, name, &["fn"]);
             Some(if top.is_empty() { None } else { pick_tier(index, fi, &top) })
         }
         // `Foo::Bar.build`: a class (or module) method, or `new` -> `initialize`. A constant that is
@@ -551,7 +564,12 @@ fn resolve_ruby(
                 for (c, level) in &classes.set {
                     match in_class(c, *level) {
                         Some(v) => targets.extend(v),
-                        None => beyond = true,
+                        // an instance of a module, or of a class whose subclasses add the method,
+                        // belongs to a class below it
+                        None => match rb.lookup_below(c, name) {
+                            Some(v) if !level => targets.extend(v),
+                            _ => beyond = true,
+                        },
                     }
                 }
                 targets.sort_unstable();
@@ -561,7 +579,8 @@ fn resolve_ruby(
             // A value of unknown type: any class that responds to the name, counting the methods
             // that have no `def` (accessors, Struct members). Too many responders is too generic
             // to link, and when an accessor could be the target no `def` is certain.
-            // Everything this method calls on the same variable (not when guarded by `respond_to?`).
+            // Everything this method calls on the same variable (not when guarded by `respond_to?`
+            // or a type test).
             let usage = rb.usage.borrow();
             let used = usage_key(call, scope)
                 .filter(|_| calls_on_receiver(call))
@@ -582,7 +601,7 @@ fn resolve_ruby(
             }
             // Structural typing from usage: everything this method calls on the same variable
             // must be answered by its class (or no program run reaches the calls without a
-            // NoMethodError). Not applied when guarded by `respond_to?`.
+            // NoMethodError). Not applied when guarded by `respond_to?` or `is_a?`.
             if let Some(used) = used
                 && used.len() > 1
             {
@@ -1384,6 +1403,11 @@ fn usage_key(call: &CallSite, scope: &str) -> Option<UsageKey> {
 fn calls_on_receiver(call: &CallSite) -> bool {
     call.kind != CallKind::SymbolRef
         || call.via.as_deref().is_some_and(|v| matches!(v, "send" | "public_send" | "__send__" | "method"))
+}
+
+/// A Ruby `def self.x` or `def Const.x`: a method of the class object.
+fn is_singleton_def(signature: &str) -> bool {
+    signature.strip_prefix("def ").and_then(|r| r.split(['(', ' ']).next()).is_some_and(|head| head.contains('.'))
 }
 
 /// A plain local, parameter or instance variable (not an expression).
@@ -2362,7 +2386,7 @@ struct RubyModel<'a> {
     /// classes that are, or directly inherit or include, a Ruby built-in: they answer its methods
     builtin: HashSet<String>,
     /// (calling symbol, receiver variable) -> methods called on it there, and whether it is
-    /// guarded by `respond_to?`
+    /// guarded by `respond_to?` or a type test
     usage: RefCell<HashMap<UsageKey, (HashSet<&'a str>, bool)>>,
     methods: HashMap<(&'a str, &'a str), Vec<SymRef>>,
     ancestors: HashMap<String, Vec<String>>,
@@ -2467,7 +2491,8 @@ impl<'a> RubyModel<'a> {
                     continue;
                 };
                 let entry = m.usage.get_mut().entry(key).or_default();
-                if c.target_name == "respond_to?" {
+                // a capability or type test: the code expects more than one kind of value
+                if matches!(c.target_name.as_str(), "respond_to?" | "is_a?" | "kind_of?" | "instance_of?") {
                     entry.1 = true;
                 }
                 entry.0.insert(c.target_name.as_str());
@@ -2564,6 +2589,25 @@ impl<'a> RubyModel<'a> {
         out
     }
 
+    /// The method as the classes that inherit or mix in `class` answer it (through their own
+    /// ancestors); `None` when none does.
+    fn lookup_below(&self, class: &str, name: &str) -> Option<Vec<SymRef>> {
+        let mut out: Option<Vec<SymRef>> = None;
+        let mut seen: HashSet<&str> = HashSet::from([class]);
+        let mut queue: Vec<&str> = vec![class];
+        while let Some(c) = queue.pop() {
+            for d in self.descendants.get(c).into_iter().flatten() {
+                if seen.len() < 64 && seen.insert(d.as_str()) {
+                    if let Some(v) = self.lookup(d, name) {
+                        out.get_or_insert_default().extend(v);
+                    }
+                    queue.push(d.as_str());
+                }
+            }
+        }
+        out
+    }
+
     fn walk<T>(
         &self,
         start: &str,
@@ -2599,46 +2643,126 @@ fn resolve_call(
     }
 }
 
-/// Types Ruby positional parameters from the arguments of the calls that resolve exactly to their
-/// method: a parameter gets a class only when every such call passes that same repo class. Runs
-/// to a fixpoint (a typed parameter can type the arguments it is passed on as).
+/// Types Ruby positional parameters from the arguments of every call that may reach their method
+/// (`ruby_callees`): a parameter gets the classes those calls pass, and none once one passes
+/// something untyped. Runs optimistically to a fixpoint: a parameter no call has typed yet adds
+/// nothing as an argument and reaches nothing as a receiver, so `def pretty_print(q) ..
+/// x.pretty_print(q)` keeps the types the other callers give `q`, and what a call reaches only
+/// grows from round to round. The parameters of methods no call reaches are unknown.
 fn infer_ruby_params(index: &Index) {
-    for _ in 0..4 {
+    let rb = &index.ruby;
+    let mut poisoned: HashSet<ParamSlot> = HashSet::new();
+    // Methods no call passing arguments reaches once the rounds settle: called from outside the
+    // repo (or not at all), so their parameters are anything. Fixed once found.
+    let mut entries: HashSet<(String, String)> = HashSet::new();
+    for _ in 0..16 {
+        let bottom = |slot: &ParamSlot| {
+            !rb.param_types.borrow().contains_key(slot)
+                && !poisoned.contains(slot)
+                && !entries.contains(&(slot.0.clone(), slot.1.clone()))
+        };
+        let mut reached: HashSet<(String, String)> = HashSet::new();
         // `None` once a caller passes something untyped
         let mut seen: HashMap<ParamSlot, Option<RClasses>> = HashMap::new();
         for (fi, file) in index.files.iter().enumerate().filter(|(_, f)| f.language == Language::Ruby) {
             let by_id: HashMap<&str, &ParsedSymbol> = file.symbols.iter().map(|s| (s.symbol_id.as_str(), s)).collect();
             for call in file.calls.iter().filter(|c| !c.arg_types.is_empty()) {
                 let Some(&caller) = by_id.get(call.from_symbol_id.as_str()) else { continue };
-                let Some((targets, Tier::Exact)) = resolve_call(index, fi, file, caller, call) else { continue };
-                let [t] = targets.as_slice() else { continue };
-                let target = index.sym(*t);
-                if target.kind != "method" && target.kind != "fn" {
+                let self_level = is_singleton_def(&caller.signature);
+                let scope = own_scope(caller);
+                let args: Vec<Option<Option<RClasses>>> = call
+                    .arg_types
+                    .iter()
+                    .map(|arg| match arg {
+                        Some(TypeExpr::Param(m, j)) if bottom(&(scope.to_string(), m.clone(), *j)) => None,
+                        _ => Some(arg.as_ref().and_then(|a| ruby_classes(index, scope, self_level, a, 0))),
+                    })
+                    .collect();
+                // a receiver no call has typed or poisoned yet reaches nothing yet
+                if let Some(TypeExpr::Param(m, j)) = &call.receiver_type
+                    && bottom(&(scope.to_string(), m.clone(), *j))
+                {
                     continue;
                 }
-                let self_level = caller.signature.starts_with("def self.");
-                for (i, arg) in call.arg_types.iter().enumerate() {
-                    let classes = arg.as_ref().and_then(|a| ruby_classes(index, own_scope(caller), self_level, a, 0));
-                    let key = (scope_of(target).to_string(), target.name.clone(), i);
-                    let slot = seen.entry(key).or_insert_with(|| Some(RClasses::default()));
-                    match (slot.as_mut(), classes) {
-                        (Some(acc), Some(c)) => acc.extend(c),
-                        _ => *slot = None,
+                for t in ruby_callees(index, fi, file, caller, call) {
+                    let target = index.sym(t);
+                    if target.kind != "method" && target.kind != "fn" {
+                        continue;
+                    }
+                    reached.insert((scope_of(target).to_string(), target.name.clone()));
+                    for (i, classes) in args.iter().enumerate() {
+                        let Some(classes) = classes else { continue };
+                        let key = (scope_of(target).to_string(), target.name.clone(), i);
+                        let slot = seen.entry(key).or_insert_with(|| Some(RClasses::default()));
+                        match (slot.as_mut(), classes) {
+                            (Some(acc), Some(c)) => acc.extend(c.clone()),
+                            _ => *slot = None,
+                        }
                     }
                 }
             }
         }
         let typed: HashMap<_, _> = seen
-            .into_iter()
+            .iter()
             .filter_map(|(k, v)| {
-                v.filter(|v| !v.set.is_empty() && v.set.len() <= MAX_HEURISTIC_CANDIDATES).map(|v| (k, v))
+                v.as_ref()
+                    .filter(|v| !v.set.is_empty() && v.set.len() <= MAX_HEURISTIC_CANDIDATES)
+                    .map(|v| (k.clone(), v.clone()))
             })
             .collect();
-        if *index.ruby.param_types.borrow() == typed {
-            return;
+        let stable = *rb.param_types.borrow() == typed;
+        poisoned = seen.into_keys().filter(|k| !typed.contains_key(k)).collect();
+        *rb.param_types.borrow_mut() = typed;
+        if stable {
+            let unreached: Vec<(String, String)> = index
+                .files
+                .iter()
+                .filter(|f| f.language == Language::Ruby)
+                .flat_map(|f| f.symbols.iter())
+                .filter(|s| s.kind == "method" || s.kind == "fn")
+                .map(|s| (scope_of(s).to_string(), s.name.clone()))
+                .filter(|m| !reached.contains(m) && !entries.contains(m))
+                .collect();
+            if unreached.is_empty() {
+                return;
+            }
+            entries.extend(unreached);
         }
-        *index.ruby.param_types.borrow_mut() = typed;
     }
+}
+
+/// The Ruby methods a call may reach: its targets, or for a call left unlinked on a value of
+/// unknown type (too generic a name, a core name), every repo method of that name and arity whose
+/// class answers everything else called on the value.
+fn ruby_callees(index: &Index, fi: usize, file: &ParsedFile, caller: &ParsedSymbol, call: &CallSite) -> Vec<SymRef> {
+    if let Some((targets, _)) = resolve_call(index, fi, file, caller, call) {
+        return targets;
+    }
+    if call.kind != CallKind::Direct || call.receiver.is_none() {
+        return Vec::new();
+    }
+    let rb = &index.ruby;
+    let scope = own_scope(caller);
+    let self_level = is_singleton_def(&caller.signature);
+    // a value of a known class without the method in the repo
+    if call.receiver_type.as_ref().is_some_and(|t| ruby_classes(index, scope, self_level, t, 0).is_some()) {
+        return Vec::new();
+    }
+    let name = call.target_name.as_str();
+    let usage = rb.usage.borrow();
+    let used = usage_key(call, scope).and_then(|k| usage.get(&k)).filter(|u| !u.1 && u.0.len() > 1).map(|u| &u.0);
+    let mut targets: Vec<SymRef> = rb
+        .responders
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter(|c| used.is_none_or(|u| rb.some_instance_responds(c, u)))
+        .flat_map(|c| rb.methods.get(&(*c, name)).into_iter().flatten().copied())
+        .filter(|r| call.args.is_none_or(|a| index.sym(*r).arity.is_none_or(|ar| ar.accepts(a))))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 /// A value passed to a method must answer what the method calls on that parameter: the usage of a
@@ -2757,9 +2881,9 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
 
         for rel in &file.impls {
             let owners: Vec<SymRef> =
-                index.candidates(&rel.type_name, TYPES).into_iter().filter(|r| r.0 == fi).collect();
+                index.candidates(file.language, &rel.type_name, TYPES).into_iter().filter(|r| r.0 == fi).collect();
             let last = rel.trait_name.rsplit(['.', ':']).next().unwrap_or(&rel.trait_name);
-            let mut supers = index.candidates(last, TYPES);
+            let mut supers = index.candidates(file.language, last, TYPES);
             if file.language == Language::Ruby {
                 let nesting = owners.first().map_or("", |o| index.sym(*o).qualified_name.as_str());
                 let Some(full) = index.ruby.resolve_const(&rel.trait_name, nesting) else { continue };
@@ -2791,7 +2915,7 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
             let Some(&owner) = by_id.get(tr.from_symbol_id.as_str()) else {
                 continue;
             };
-            let mut cands = index.candidates(&tr.type_name, TYPES);
+            let mut cands = index.candidates(file.language, &tr.type_name, TYPES);
             if file.language == Language::Go {
                 // Go types are package-scoped: `T` is the caller's package (or a dot-import), `pkg.T`
                 // that import's package, and nothing for a package outside the repo.
@@ -3473,6 +3597,78 @@ end
         let ship: Vec<_> = from("ship").into_iter().filter(|e| e.to.contains("::label#")).collect();
         assert_eq!(ship.len(), 1, "{ship:#?}");
         assert!(ship[0].to.contains("::Pack::") && ship[0].confidence == "STATIC_EXACT");
+    }
+
+    #[test]
+    fn ruby_params_are_typed_from_every_call_that_may_reach_them() {
+        let src = "module Printer
+  def pp(obj)
+    obj.pretty_print(self)
+  end
+end
+class Fancy
+  include Printer
+  def text(s); end
+end
+class Plain
+  include Printer
+  def text(s); end
+end
+class Other
+  def text(s); end
+  def pp(o); end
+end
+class Point
+  def pretty_print(q)
+    q.text(1)
+    q.pp(2)
+  end
+end
+class Box
+  def pretty_print(q)
+    q.text(3)
+    inner.pretty_print(q)
+  end
+end
+";
+        let mut files = vec![parse_as("lib/p.rb", Language::Ruby, src)];
+        let edges = link(&mut files);
+        let from = |caller: &str, to: &str| {
+            let callers: Vec<_> =
+                files[0].symbols.iter().filter(|s| s.qualified_name == caller).map(|s| s.symbol_id.clone()).collect();
+            edges
+                .iter()
+                .filter(|e| callers.contains(&e.from) && e.kind == "CALLS" && e.to.contains(to))
+                .collect::<Vec<_>>()
+        };
+        // `obj.pretty_print(self)` reaches both `pretty_print`s (two targets, so not exact) and
+        // passes a Printer; Box passes its own `q` on without poisoning it
+        let pp = from("Point::pretty_print", "::pp#");
+        assert_eq!(pp.len(), 1, "{pp:#?}");
+        assert!(pp[0].to.contains("::Printer::pp#") && pp[0].confidence == "STATIC_EXACT");
+        // a Printer is a Fancy or a Plain: their `text`, never Other's
+        let text = from("Box::pretty_print", "::text#");
+        assert_eq!(text.len(), 2, "{text:#?}");
+        assert!(text.iter().all(|e| !e.to.contains("::Other::")));
+    }
+
+    #[test]
+    fn calls_link_only_within_their_own_language() {
+        let mut files = vec![
+            parse_as(
+                "lib/m.rb",
+                Language::Ruby,
+                "class Matcher\n  def match(x); end\n  def self.find; end\nend\nclass PP\n  def PP.pp(o); end\n  def pp(o); end\nend\nclass Caller\n  def run\n    PP.pp(1)\n  end\nend\n",
+            ),
+            parse_as("web/search.js", Language::TypeScript, "function hit(s) { return s.match(/x/); }\n"),
+        ];
+        let edges = link(&mut files);
+        assert!(edges.iter().all(|e| !e.from.starts_with("web/")), "{edges:#?}");
+        // `def PP.pp` is the class method `PP.pp` names, not the instance `pp`
+        let run: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "run")).collect();
+        assert_eq!(run.len(), 1, "{run:#?}");
+        assert!(files[0].symbols.iter().any(|s| s.symbol_id == run[0].to && s.signature.starts_with("def PP.pp")));
+        assert_eq!(run[0].confidence, "STATIC_EXACT");
     }
 
     #[test]

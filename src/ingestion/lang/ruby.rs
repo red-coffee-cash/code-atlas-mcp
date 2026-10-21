@@ -953,9 +953,10 @@ counter = 0
 # Billing core.
 # Second line.
 module Billing
+  # Rates (a < b)
   RATE = 2
 
-  class Account::Ledger < Base
+  class Account::Ledger < Base # the books
     LIMIT = 10
     @state = 1
 
@@ -985,6 +986,9 @@ Second line."
 
         let ledger = sym(&p, "Ledger");
         assert_eq!((ledger.kind, ledger.qualified_name.as_str()), ("class", "Billing::Account::Ledger"));
+        // comments after the header are not part of the declaration
+        assert_eq!(ledger.signature, "class Account::Ledger < Base");
+        assert_eq!(sym(&p, "Billing").signature, "module Billing");
         assert_eq!(sym(&p, "LIMIT").qualified_name, "Billing::Account::Ledger::LIMIT");
 
         let post = sym(&p, "post");
