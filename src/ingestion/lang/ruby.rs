@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use tree_sitter::Node;
 
-use super::{Compiled, Frontend, text};
+use super::{Compiled, Frontend, own_line, text};
 use crate::ingestion::model::{ImplRel, ImportDecl};
 use crate::ingestion::walker::SourceFile;
 
@@ -157,7 +157,7 @@ impl Frontend for RubyFrontend {
         let mut lines = Vec::new();
         let mut row = anchor.start_position().row;
         let mut prev = anchor.prev_sibling();
-        while let Some(c) = prev.filter(|c| c.kind() == "comment" && c.end_position().row + 1 >= row) {
+        while let Some(c) = prev.filter(|c| c.kind() == "comment" && c.end_position().row + 1 >= row && own_line(*c)) {
             let raw = text(c, src);
             let body = raw.trim_start_matches('#').trim();
             if !MAGIC_COMMENTS.iter().any(|m| body.starts_with(m)) {
@@ -704,5 +704,13 @@ end
         );
         assert_eq!(sym(&a, "f").ast_blake3, sym(&b, "f").ast_blake3);
         assert_ne!(sym(&a, "f").ast_blake3, sym(&c, "f").ast_blake3);
+    }
+
+    #[test]
+    fn trailing_comments_are_not_docs() {
+        let p = parse("A = 1 # first\nB = 2\nx = 1 # note\ndef f; end\n# Real doc.\ndef g; end\n");
+        assert_eq!(sym(&p, "B").doc_comment, "");
+        assert_eq!(sym(&p, "f").doc_comment, "");
+        assert_eq!(sym(&p, "g").doc_comment, "Real doc.");
     }
 }

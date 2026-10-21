@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use tree_sitter::Node;
 
-use super::{Compiled, Frontend, text};
+use super::{Compiled, Frontend, own_line, text};
 use crate::ingestion::model::ImportDecl;
 use crate::ingestion::walker::SourceFile;
 
@@ -192,9 +192,14 @@ fn leading_comments<'a>(def: Node, src: &'a [u8]) -> Vec<&'a str> {
     if !direct.is_empty() {
         return direct;
     }
+    // Only the first spec of a group inherits the declaration's comment.
+    let mut prev = def.prev_named_sibling();
+    while prev.is_some_and(|p| p.kind() == "comment") {
+        prev = prev.and_then(|p| p.prev_named_sibling());
+    }
+    let first_spec = prev.is_none();
     let mut anchor = def;
     while let Some(p) = anchor.parent() {
-        let first_spec = anchor.prev_named_sibling().is_none();
         match p.kind() {
             "var_spec_list" => anchor = p,
             "type_declaration" | "const_declaration" | "var_declaration" if first_spec => {
@@ -210,7 +215,7 @@ fn comments_above<'a>(node: Node, src: &'a [u8]) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut row = node.start_position().row;
     let mut prev = node.prev_sibling();
-    while let Some(c) = prev.filter(|c| c.kind() == "comment" && c.end_position().row + 1 >= row) {
+    while let Some(c) = prev.filter(|c| c.kind() == "comment" && c.end_position().row + 1 >= row && own_line(*c)) {
         out.push(text(c, src));
         row = c.start_position().row;
         prev = c.prev_sibling();
@@ -298,6 +303,7 @@ func helper(x int) {
         assert_eq!(sym(&p, "Alias").kind, "struct");
         assert_eq!((sym(&p, "Max").kind, sym(&p, "Min").kind, sym(&p, "hidden").kind), ("const", "const", "const"));
         assert_eq!(sym(&p, "Min").doc_comment, "Min is the floor.");
+        assert_eq!(sym(&p, "hidden").doc_comment, "");
         assert_eq!((sym(&p, "counter").kind, sym(&p, "Registry").kind), ("global", "global"));
 
         let handle = sym(&p, "Handle");
@@ -486,5 +492,16 @@ func check(int) {}
         let c = parse("package s\nfunc f(x int) int {\n\treturn x + 2\n}\n");
         assert_eq!(sym(&a, "f").ast_blake3, sym(&b, "f").ast_blake3);
         assert_ne!(sym(&a, "f").ast_blake3, sym(&c, "f").ast_blake3);
+    }
+
+    #[test]
+    fn trailing_comments_and_later_group_specs_get_no_doc() {
+        let p = parse(
+            "package s\n\nconst (\n\tA = 1 // first\n\tB = 2\n)\n\n// Defaults.\nvar (\n\tX = 1\n\tY = 2\n)\n\nvar z = 1 // trailing\nfunc f() {}\n",
+        );
+        assert_eq!(sym(&p, "B").doc_comment, "");
+        assert_eq!(sym(&p, "X").doc_comment, "Defaults.");
+        assert_eq!(sym(&p, "Y").doc_comment, "");
+        assert_eq!(sym(&p, "f").doc_comment, "");
     }
 }

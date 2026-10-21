@@ -94,6 +94,11 @@ pub fn risk_flag_for_capture(suffix: &str) -> Option<&'static str> {
     })
 }
 
+/// A comment on a line of its own, not trailing code (`A = 1 // first`); only those can be docs.
+pub(crate) fn own_line(comment: Node) -> bool {
+    comment.prev_sibling().is_none_or(|p| p.end_position().row < comment.start_position().row)
+}
+
 pub(crate) fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
