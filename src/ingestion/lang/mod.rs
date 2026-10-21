@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Query};
 
-use super::model::{ImplRel, ImportDecl};
+use super::model::{ImplRel, ImportDecl, TypeExpr, TypeFacts};
 use super::walker::{Language, SourceFile};
 
 pub mod go;
@@ -57,6 +57,16 @@ pub trait Frontend: Sync {
     /// Inheritance and trait-implementation relations declared in the file.
     fn implements(&self, _root: Node, _src: &[u8]) -> Vec<ImplRel> {
         Vec::new()
+    }
+
+    /// The receiver's type as far as the enclosing code shows it (parameters, locals, literals).
+    fn receiver_type(&self, _receiver: Node, _src: &[u8]) -> Option<TypeExpr> {
+        None
+    }
+
+    /// File-level declarations that type receivers in other files (fields, results, globals).
+    fn type_facts(&self, _root: Node, _src: &[u8]) -> TypeFacts {
+        TypeFacts::default()
     }
 
     /// Whether a macro invocation wraps external I/O or unsafe code (spec §10.3).

@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::model::{CallKind, ParsedFile, ParsedSymbol, TypeRefKind};
+use std::cell::RefCell;
+
+use super::model::{CallKind, CallSite, ParsedFile, ParsedSymbol, TypeExpr, TypeRefKind};
 use super::walker::Language;
 
 /// Beyond this many candidates a name is too generic (`clone`, `to_string`) to link.
@@ -74,6 +76,8 @@ struct Index<'a> {
     go_imports: Vec<HashMap<&'a str, Vec<usize>>>,
     /// Go, per file: files of dot-imported packages, whose names are callable unqualified
     go_dot_imports: Vec<HashSet<usize>>,
+    ruby: RubyModel<'a>,
+    go: GoModel<'a>,
 }
 
 /// Resolves all references in `files` to edges and marks symbols registered as route handlers
@@ -157,7 +161,10 @@ impl<'a> Index<'a> {
             aliases: vec![HashMap::new(); files.len()],
             go_imports: vec![HashMap::new(); files.len()],
             go_dot_imports: vec![HashSet::new(); files.len()],
+            ruby: RubyModel::build(files),
+            go: GoModel::default(),
         };
+        index.go = GoModel::build(files, &index.module_keys);
         let go_packages = GoPackages::build(files, &index.module_keys);
         let by_path: HashMap<&str, usize> = files.iter().enumerate().map(|(i, f)| (f.rel_path.as_str(), i)).collect();
         for (fi, f) in files.iter().enumerate() {
@@ -313,7 +320,8 @@ fn narrow_by_receiver(
     // `auth.Verify()` / `str.ToUpper()` in Go: the receiver names an imported package, so only that
     // package's functions qualify; a package outside the repo (stdlib) yields nothing.
     if let Some(pkg) = index.go_imports[caller_file].get(receiver.trim()) {
-        return cands.into_iter().filter(|r| pkg.contains(&r.0) && index.sym(*r).kind == "fn").collect();
+        let in_pkg = cands.into_iter().filter(|r| pkg.contains(&r.0) && index.sym(*r).kind == "fn").collect();
+        return go_prefer_default_build(index, in_pkg);
     }
     let segment = receiver.rsplit("::").next().unwrap_or(receiver).trim();
     // `np.array(..)` after `import numpy as np`: the receiver is an alias for the module.
@@ -414,6 +422,823 @@ impl EdgeAcc {
     }
 }
 
+/// Tiered resolution shared by all languages: candidates by name and kind, narrowed by receiver,
+/// then the nearest tier (same file, imported, repo).
+fn resolve_generic(
+    index: &Index,
+    file: &ParsedFile,
+    fi: usize,
+    caller: &ParsedSymbol,
+    call: &CallSite,
+    name: &str,
+) -> Option<(Vec<SymRef>, Tier)> {
+    // A bare `f(..)` or bare identifier argument can only name a free function; methods need a
+    // receiver or qualifier (`x.f()`, `Self::f`, `self.f`).
+    let kinds: &[&str] = if call.receiver.is_none() { &["fn"] } else { CALLABLE };
+    let mut cands = index.candidates(name, kinds);
+    if file.language == Language::Go && call.receiver.is_none() {
+        // An unqualified Go name is declared in the caller's own package or a dot-import.
+        cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0));
+        cands = go_prefer_default_build(index, cands);
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // A Go receiver whose type the caller's code shows: resolve through the type model.
+    if file.language == Language::Go
+        && let (Some(r), Some(rt)) = (&call.receiver, &call.receiver_type)
+        && !index.go_imports[fi].contains_key(r.trim())
+        && let Some(typed) = go_typed_call(index, fi, rt, name)
+    {
+        return typed;
+    }
+    if let Some(r) = &call.receiver {
+        cands = narrow_by_receiver(index, caller, fi, r, cands);
+    }
+    match call.kind {
+        // Macro identifiers are only trusted when defined locally or imported (§10.3).
+        CallKind::MacroIdent => {
+            let near: Vec<SymRef> =
+                cands.iter().copied().filter(|r| r.0 == fi || index.imported_files[fi].contains(&r.0)).collect();
+            (!near.is_empty() && near.len() <= MAX_HEURISTIC_CANDIDATES).then_some((near, Tier::Heuristic))
+        }
+        _ => pick_tier(index, fi, &cands),
+    }
+}
+
+/// Exact for one target, heuristic for a few, nothing for none or too many.
+fn decide(targets: Vec<SymRef>, tier: Tier) -> Option<(Vec<SymRef>, Tier)> {
+    match targets.len() {
+        0 => None,
+        1 => Some((targets, tier)),
+        n if n <= MAX_HEURISTIC_CANDIDATES => Some((targets, Tier::Heuristic)),
+        _ => None,
+    }
+}
+
+/// Ruby method resolution through the class model. `Some(None)` means "resolved to nothing in the
+/// repo" (a stdlib class, an inherited external method); `None` defers to the generic tiers, which
+/// is what calls on values of unknown type get.
+fn resolve_ruby(
+    index: &Index,
+    caller: &ParsedSymbol,
+    fi: usize,
+    call: &CallSite,
+    name: &str,
+) -> Option<Option<(Vec<SymRef>, Tier)>> {
+    let rb = &index.ruby;
+    let scope = own_scope(caller);
+    // `Foo.x` and calls inside `def self.y` want class methods; calls on instances want instance
+    // methods. `def self.x` and `def x` can coexist; when the wanted kind exists, keep only it.
+    let in_class = |class: &str, class_level: bool| {
+        let mut found = rb.lookup(class, name);
+        if found.is_empty() && name == "new" {
+            return rb.lookup(class, "initialize");
+        }
+        let singleton = |r: &SymRef| index.sym(*r).signature.starts_with("def self.");
+        let wanted: Vec<SymRef> = found.iter().copied().filter(|r| singleton(r) == class_level).collect();
+        if !wanted.is_empty() {
+            found = wanted;
+        }
+        found
+    };
+    // a class-body DSL call takes symbols naming instance methods (`before_action :x`)
+    let self_level = if caller.kind == "class" {
+        call.kind != CallKind::SymbolRef
+    } else {
+        caller.signature.starts_with("def self.")
+    };
+    match call.receiver.as_deref().map(str::trim) {
+        // A self call: the caller's class and its ancestors, then (for a module or a base class)
+        // the classes that mix it in or extend it, then top-level methods, which are private
+        // methods of Object. It never reaches an unrelated class.
+        None | Some("self") => {
+            if !scope.is_empty() {
+                let own = in_class(scope, self_level);
+                if !own.is_empty() {
+                    return Some(decide(own, Tier::Exact));
+                }
+                let below = rb.descendant_methods(scope, name);
+                if !below.is_empty() {
+                    return Some(decide(below, Tier::Heuristic));
+                }
+            }
+            let top: Vec<SymRef> = index
+                .candidates(name, &["fn"])
+                .into_iter()
+                .filter(|r| index.files[r.0].language == Language::Ruby)
+                .collect();
+            Some(if top.is_empty() { None } else { pick_tier(index, fi, &top) })
+        }
+        // `Foo::Bar.build`: a class (or module) method, or `new` -> `initialize`. A constant that is
+        // not a repo class (`File`, `JSON`) has no repo methods.
+        Some(r) if is_const_path(r) => {
+            Some(rb.resolve_const(r, scope).and_then(|c| decide(in_class(&c, true), Tier::Exact)))
+        }
+        // A receiver whose class the method shows (`x = Foo.new`, `@x`, `self.class`).
+        Some(_) => {
+            let ty = call.receiver_type.as_ref()?;
+            let class_level = matches!(ty, TypeExpr::Named(t) if t == "self.class");
+            match ruby_receiver_class(index, scope, ty, 0)? {
+                Some(class) => Some(decide(in_class(&class, class_level), Tier::Exact)),
+                None => Some(None),
+            }
+        }
+    }
+}
+
+/// `Some(Some(class))` for a repo class, `Some(None)` for a class outside the repo, `None` unknown.
+fn ruby_receiver_class(index: &Index, scope: &str, ty: &TypeExpr, depth: u8) -> Option<Option<String>> {
+    match ty {
+        TypeExpr::Named(t) if t == "self" || t == "self.class" => (!scope.is_empty()).then(|| Some(scope.to_string())),
+        TypeExpr::Named(t) => Some(index.ruby.resolve_const(t, scope)),
+        TypeExpr::Field(base, ivar) if depth < 4 => {
+            let Some(Some(class)) = ruby_receiver_class(index, scope, base, depth + 1) else { return None };
+            let (owner, t) = index.ruby.ivar_type(&class, ivar)?;
+            ruby_receiver_class(index, &owner, t, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn is_const_path(r: &str) -> bool {
+    r.trim_start_matches("::").split("::").all(|seg| {
+        seg.starts_with(|c: char| c.is_ascii_uppercase()) && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Go's type model: named types per package, struct fields and embedding, interface method sets,
+/// first results of functions and methods, package-level variables, and method sets.
+#[derive(Default)]
+struct GoModel<'a> {
+    /// per file: package id (Go files only)
+    pkg: Vec<Option<usize>>,
+    types: HashMap<(usize, &'a str), &'static str>,
+    fields: HashMap<(usize, &'a str, &'a str), (&'a TypeExpr, usize)>,
+    embeds: HashMap<(usize, &'a str), Vec<(&'a str, usize)>>,
+    iface: HashMap<(usize, &'a str), Vec<&'a str>>,
+    results: HashMap<(usize, &'a str, &'a str), (&'a str, usize)>,
+    vars: HashMap<(usize, &'a str), (&'a TypeExpr, usize)>,
+    /// (package, type, method) -> method symbols
+    methods: HashMap<(usize, &'a str, &'a str), Vec<SymRef>>,
+    /// (package, type) -> method names
+    method_sets: HashMap<(usize, &'a str), HashSet<&'a str>>,
+    /// (required method names joined, called method) -> implementing methods
+    cha_cache: RefCell<HashMap<(String, String), Vec<SymRef>>>,
+    /// per file: part of the default build (linux/amd64, cgo); false for other platforms' files
+    default_build: Vec<bool>,
+}
+
+/// A resolved Go type.
+#[derive(Clone, Debug)]
+enum GoType {
+    /// A named type declared in the repo: (package, name, "struct" | "interface").
+    Repo(usize, String, &'static str),
+    /// A type from outside the repo (stdlib, third party, builtin), as written.
+    External(String),
+    /// A slice, array, map or channel: its element type as written, in the given file's context.
+    Container(String, usize),
+    /// An imported package (its repo files; empty for an external package).
+    Package(Vec<usize>),
+}
+
+const GO_BUILTIN_TYPES: &[&str] = &[
+    "bool",
+    "byte",
+    "rune",
+    "string",
+    "error",
+    "any",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+];
+
+/// Method sets of the standard-library interfaces that repo types commonly implement. A call on
+/// one of these may dispatch to any repo type with all the methods.
+const GO_STD_INTERFACES: &[(&str, &[&str])] = &[
+    ("error", &["Error"]),
+    ("fmt.Stringer", &["String"]),
+    ("io.Reader", &["Read"]),
+    ("io.Writer", &["Write"]),
+    ("io.Closer", &["Close"]),
+    ("io.ReadCloser", &["Read", "Close"]),
+    ("io.WriteCloser", &["Write", "Close"]),
+    ("io.ReadWriter", &["Read", "Write"]),
+    ("io.ReadWriteCloser", &["Read", "Write", "Close"]),
+    ("io.ReaderAt", &["ReadAt"]),
+    ("io.WriterTo", &["WriteTo"]),
+    ("io.ReaderFrom", &["ReadFrom"]),
+    ("io.Seeker", &["Seek"]),
+    ("io.StringWriter", &["WriteString"]),
+    ("io.ByteReader", &["ReadByte"]),
+    ("sort.Interface", &["Len", "Less", "Swap"]),
+    ("heap.Interface", &["Len", "Less", "Swap", "Push", "Pop"]),
+    ("http.Handler", &["ServeHTTP"]),
+    ("http.RoundTripper", &["RoundTrip"]),
+    ("http.ResponseWriter", &["Header", "Write", "WriteHeader"]),
+    ("net.Conn", &["Read", "Write", "Close", "LocalAddr", "RemoteAddr"]),
+    ("net.Listener", &["Accept", "Close", "Addr"]),
+    ("net.Addr", &["Network", "String"]),
+    ("net.Error", &["Error", "Timeout"]),
+    ("fs.FS", &["Open"]),
+    ("fs.File", &["Stat", "Read", "Close"]),
+    ("fs.FileInfo", &["Name", "Size", "Mode", "ModTime", "IsDir", "Sys"]),
+    ("os.FileInfo", &["Name", "Size", "Mode", "ModTime", "IsDir", "Sys"]),
+    ("fs.DirEntry", &["Name", "IsDir", "Type", "Info"]),
+    ("os.DirEntry", &["Name", "IsDir", "Type", "Info"]),
+    ("context.Context", &["Deadline", "Done", "Err", "Value"]),
+    ("flag.Value", &["String", "Set"]),
+    ("hash.Hash", &["Write", "Sum", "Reset", "Size", "BlockSize"]),
+    ("json.Marshaler", &["MarshalJSON"]),
+    ("json.Unmarshaler", &["UnmarshalJSON"]),
+    ("encoding.TextMarshaler", &["MarshalText"]),
+    ("encoding.TextUnmarshaler", &["UnmarshalText"]),
+    ("driver.Valuer", &["Value"]),
+    ("sql.Scanner", &["Scan"]),
+];
+
+impl<'a> GoModel<'a> {
+    fn build(files: &'a [ParsedFile], module_keys: &[String]) -> Self {
+        let mut m = Self::default();
+        let mut ids: HashMap<&str, usize> = HashMap::new();
+        m.pkg = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                (f.language == Language::Go).then(|| {
+                    let n = ids.len();
+                    *ids.entry(module_keys[i].as_str()).or_insert(n)
+                })
+            })
+            .collect();
+        m.default_build = files
+            .iter()
+            .map(|f| {
+                f.language != Language::Go
+                    || (go_filename_matches(&f.rel_path)
+                        && f.facts.build_constraint.as_deref().is_none_or(go_constraint_holds))
+            })
+            .collect();
+        for (fi, f) in files.iter().enumerate() {
+            let Some(p) = m.pkg[fi] else { continue };
+            for (si, s) in f.symbols.iter().enumerate() {
+                match s.kind {
+                    "struct" | "interface" => {
+                        m.types.insert((p, s.name.as_str()), s.kind);
+                    }
+                    "method" => {
+                        let owner = scope_of(s);
+                        m.methods.entry((p, owner, s.name.as_str())).or_default().push((fi, si));
+                        m.method_sets.entry((p, owner)).or_default().insert(s.name.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            let facts = &f.facts;
+            for (owner, field, ty) in &facts.fields {
+                m.fields.insert((p, owner.as_str(), field.as_str()), (ty, fi));
+            }
+            for (owner, ty) in &facts.embeds {
+                m.embeds.entry((p, owner.as_str())).or_default().push((ty.as_str(), fi));
+            }
+            for (iface, method) in &facts.iface_methods {
+                m.iface.entry((p, iface.as_str())).or_default().push(method.as_str());
+            }
+            for (owner, name, ty) in &facts.results {
+                m.results.insert((p, owner.as_str(), name.as_str()), (ty.as_str(), fi));
+            }
+            for (name, ty) in &facts.vars {
+                m.vars.insert((p, name.as_str()), (ty, fi));
+            }
+        }
+        m
+    }
+}
+
+const GO_OS: &[&str] = &[
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "hurd",
+    "illumos",
+    "ios",
+    "js",
+    "linux",
+    "nacl",
+    "netbsd",
+    "openbsd",
+    "plan9",
+    "solaris",
+    "wasip1",
+    "windows",
+    "zos",
+];
+const GO_ARCH: &[&str] = &[
+    "386",
+    "amd64",
+    "amd64p32",
+    "arm",
+    "armbe",
+    "arm64",
+    "arm64be",
+    "loong64",
+    "mips",
+    "mipsle",
+    "mips64",
+    "mips64le",
+    "mips64p32",
+    "mips64p32le",
+    "ppc",
+    "ppc64",
+    "ppc64le",
+    "riscv",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sparc",
+    "sparc64",
+    "wasm",
+];
+
+/// `x_windows.go`, `x_arm64.go`, `x_darwin_arm64.go` only build on that platform.
+fn go_filename_matches(rel_path: &str) -> bool {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let stem = name.strip_suffix(".go").unwrap_or(name);
+    let stem = stem.strip_suffix("_test").unwrap_or(stem);
+    let parts: Vec<&str> = stem.split('_').skip(1).collect();
+    match parts.as_slice() {
+        [.., os, arch] if GO_OS.contains(os) && GO_ARCH.contains(arch) => *os == "linux" && *arch == "amd64",
+        [.., last] if GO_ARCH.contains(last) => *last == "amd64",
+        [.., last] if GO_OS.contains(last) => *last == "linux",
+        _ => true,
+    }
+}
+
+/// Evaluates a `//go:build` expression for linux/amd64 with cgo and the gc toolchain.
+fn go_constraint_holds(expr: &str) -> bool {
+    fn tag(t: &str) -> bool {
+        matches!(t, "linux" | "amd64" | "unix" | "cgo" | "gc") || t.starts_with("go1.")
+    }
+    // recursive descent over `||`, `&&`, `!`, parentheses
+    fn or(tokens: &[String], i: &mut usize) -> bool {
+        let mut v = and(tokens, i);
+        while tokens.get(*i).is_some_and(|t| t == "||") {
+            *i += 1;
+            v |= and(tokens, i);
+        }
+        v
+    }
+    fn and(tokens: &[String], i: &mut usize) -> bool {
+        let mut v = not(tokens, i);
+        while tokens.get(*i).is_some_and(|t| t == "&&") {
+            *i += 1;
+            v &= not(tokens, i);
+        }
+        v
+    }
+    fn not(tokens: &[String], i: &mut usize) -> bool {
+        match tokens.get(*i).map(String::as_str) {
+            Some("!") => {
+                *i += 1;
+                !not(tokens, i)
+            }
+            Some("(") => {
+                *i += 1;
+                let v = or(tokens, i);
+                *i += 1; // `)`
+                v
+            }
+            Some(t) => {
+                *i += 1;
+                tag(t)
+            }
+            None => true,
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut chars = expr.chars().peekable();
+    while let Some(c) = chars.next() {
+        let op = match c {
+            '(' | ')' | '!' => Some(c.to_string()),
+            '&' | '|' if chars.peek() == Some(&c) => {
+                chars.next();
+                Some(format!("{c}{c}"))
+            }
+            c if c.is_whitespace() => None,
+            c => {
+                word.push(c);
+                continue;
+            }
+        };
+        if !word.is_empty() {
+            tokens.push(std::mem::take(&mut word));
+        }
+        tokens.extend(op);
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+    or(&tokens, &mut 0)
+}
+
+/// Among same-named Go definitions in one package (platform variants selected by build
+/// constraints), keep those of the default build when it has any.
+fn go_prefer_default_build(index: &Index, cands: Vec<SymRef>) -> Vec<SymRef> {
+    if cands.len() < 2 {
+        return cands;
+    }
+    let default: Vec<SymRef> = cands.iter().copied().filter(|r| index.go.default_build[r.0]).collect();
+    if default.is_empty() { cands } else { default }
+}
+
+/// Resolves a call on a receiver of known type. `None`: the type is unknown, use the generic
+/// tiers. `Some(None)`: the call provably targets no repo method (a stdlib type, a field holding
+/// a func, a method promoted from an external embedded type).
+fn go_typed_call(index: &Index, fi: usize, rt: &TypeExpr, method: &str) -> Option<Option<(Vec<SymRef>, Tier)>> {
+    Some(match go_resolve(index, fi, rt, 0)? {
+        GoType::Repo(p, t, "struct") => {
+            decide(go_prefer_default_build(index, go_method(index, p, &t, method, 0)), Tier::Exact)
+        }
+        GoType::Repo(p, t, _) => {
+            let required = go_iface_methods(index, p, &t, 0);
+            decide(go_implementers(index, &required, method), Tier::Heuristic)
+        }
+        GoType::External(t) => {
+            let t = t.trim_start_matches('*');
+            match GO_STD_INTERFACES.iter().find(|(name, _)| *name == t) {
+                Some((_, required)) => {
+                    let required: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+                    decide(go_implementers(index, &required, method), Tier::Heuristic)
+                }
+                None => None,
+            }
+        }
+        GoType::Container(..) | GoType::Package(_) => None,
+    })
+}
+
+/// A named type as written (`*pkg.T`, `[]T`, `map[K]V`), in the context of file `fi`.
+fn go_resolve_text(index: &Index, fi: usize, text: &str) -> Option<GoType> {
+    let t = text.trim().trim_start_matches('*').trim();
+    for prefix in ["[]", "chan ", "<-chan ", "chan<- ", "..."] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return Some(GoType::Container(rest.to_string(), fi));
+        }
+    }
+    if t.starts_with('[') || t.starts_with("map[") {
+        // `[N]T` / `map[K]V`: the element follows the bracket that closes the first one
+        let open = t.find('[')?;
+        let mut depth = 0;
+        for (i, c) in t[open..].char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(GoType::Container(t[open + i + 1..].to_string(), fi));
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    // anonymous struct and func types have no methods; `interface{ M() }` is left unknown
+    if t.starts_with("func") || t.starts_with("struct") || t == "interface{}" {
+        return Some(GoType::External(t.to_string()));
+    }
+    if t.starts_with("interface") {
+        return None;
+    }
+    let t = t.split('[').next().unwrap_or(t); // generic instantiation `List[T]`
+    let p = index.go.pkg[fi]?;
+    match t.split_once('.') {
+        Some((q, name)) => {
+            let files = index.go_imports[fi].get(q)?;
+            let Some(&f0) = files.first() else {
+                return Some(GoType::External(t.to_string()));
+            };
+            let qp = index.go.pkg[f0]?;
+            let kind = index.go.types.get(&(qp, name))?;
+            Some(GoType::Repo(qp, name.to_string(), kind))
+        }
+        None => {
+            if let Some(kind) = index.go.types.get(&(p, t)) {
+                return Some(GoType::Repo(p, t.to_string(), kind));
+            }
+            for &d in &index.go_dot_imports[fi] {
+                if let Some(dp) = index.go.pkg[d]
+                    && let Some(kind) = index.go.types.get(&(dp, t))
+                {
+                    return Some(GoType::Repo(dp, t.to_string(), kind));
+                }
+            }
+            GO_BUILTIN_TYPES.contains(&t).then(|| GoType::External(t.to_string()))
+        }
+    }
+}
+
+fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<GoType> {
+    if depth > 12 {
+        return None;
+    }
+    let d = depth + 1;
+    let p = index.go.pkg[fi]?;
+    match expr {
+        TypeExpr::Named(t) => go_resolve_text(index, fi, t),
+        TypeExpr::Ident(n) => {
+            if let Some(files) = index.go_imports[fi].get(n.as_str()) {
+                return Some(GoType::Package(files.clone()));
+            }
+            let &(ty, vf) = index.go.vars.get(&(p, n.as_str()))?;
+            go_resolve(index, vf, ty, d)
+        }
+        TypeExpr::Field(base, f) => match go_resolve(index, fi, base, d)? {
+            GoType::Package(files) => {
+                let &f0 = files.first()?;
+                let qp = index.go.pkg[f0]?;
+                let &(ty, vf) = index.go.vars.get(&(qp, f.as_str()))?;
+                go_resolve(index, vf, ty, d)
+            }
+            GoType::Repo(tp, t, "struct") => {
+                let (ty, vf) = go_field(index, tp, &t, f, 0)?;
+                go_resolve(index, vf, ty, d)
+            }
+            GoType::External(t) => Some(GoType::External(format!("{t}.{f}?"))),
+            _ => None,
+        },
+        TypeExpr::Call(callee) => match callee.as_ref() {
+            TypeExpr::Ident(f) => {
+                // a conversion `T(x)` or a call of a package-level function
+                if let Some(t) = go_resolve_text(index, fi, f) {
+                    return Some(t);
+                }
+                let &(ty, rf) = index.go.results.get(&(p, "", f.as_str()))?;
+                go_resolve_text(index, rf, ty)
+            }
+            TypeExpr::Field(base, m) => match go_resolve(index, fi, base, d)? {
+                GoType::Package(files) => {
+                    let Some(&f0) = files.first() else {
+                        return Some(GoType::External(format!("{m}()?")));
+                    };
+                    let qp = index.go.pkg[f0]?;
+                    if let Some(kind) = index.go.types.get(&(qp, m.as_str())) {
+                        return Some(GoType::Repo(qp, m.to_string(), kind));
+                    }
+                    let &(ty, rf) = index.go.results.get(&(qp, "", m.as_str()))?;
+                    go_resolve_text(index, rf, ty)
+                }
+                GoType::Repo(tp, t, _) => {
+                    let (ty, rf) = go_result(index, tp, &t, m, 0)?;
+                    go_resolve_text(index, rf, ty)
+                }
+                GoType::External(t) => Some(GoType::External(format!("{t}.{m}()?"))),
+                GoType::Container(..) => None,
+            },
+            _ => None,
+        },
+        TypeExpr::Elem(inner) => match go_resolve(index, fi, inner, d)? {
+            GoType::Container(t, cf) => go_resolve_text(index, cf, &t),
+            _ => None,
+        },
+    }
+}
+
+/// The embedded types of `t`, resolved.
+fn go_embedded(index: &Index, p: usize, t: &str) -> Vec<GoType> {
+    index.go.embeds.get(&(p, t)).into_iter().flatten().filter_map(|&(e, ef)| go_resolve_text(index, ef, e)).collect()
+}
+
+fn go_field<'a>(index: &Index<'a>, p: usize, t: &str, f: &str, depth: u8) -> Option<(&'a TypeExpr, usize)> {
+    if let Some(&hit) = index.go.fields.get(&(p, t, f)) {
+        return Some(hit);
+    }
+    if depth > 4 {
+        return None;
+    }
+    go_embedded(index, p, t).into_iter().find_map(|e| match e {
+        GoType::Repo(ep, et, _) => go_field(index, ep, &et, f, depth + 1),
+        _ => None,
+    })
+}
+
+fn go_result<'a>(index: &Index<'a>, p: usize, t: &str, m: &str, depth: u8) -> Option<(&'a str, usize)> {
+    if let Some(&hit) = index.go.results.get(&(p, t, m)) {
+        return Some(hit);
+    }
+    if depth > 4 {
+        return None;
+    }
+    go_embedded(index, p, t).into_iter().find_map(|e| match e {
+        GoType::Repo(ep, et, _) => go_result(index, ep, &et, m, depth + 1),
+        _ => None,
+    })
+}
+
+/// Methods named `m` on struct `t`, or promoted from its embedded repo types.
+fn go_method(index: &Index, p: usize, t: &str, m: &str, depth: u8) -> Vec<SymRef> {
+    if let Some(v) = index.go.methods.get(&(p, t, m)) {
+        return v.clone();
+    }
+    if depth > 4 {
+        return Vec::new();
+    }
+    go_embedded(index, p, t)
+        .into_iter()
+        .find_map(|e| match e {
+            GoType::Repo(ep, et, "struct") => Some(go_method(index, ep, &et, m, depth + 1)).filter(|v| !v.is_empty()),
+            GoType::Repo(ep, et, _) => {
+                let required = go_iface_methods(index, ep, &et, 0);
+                Some(go_implementers(index, &required, m)).filter(|v| !v.is_empty())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The method names an interface requires, including those of embedded interfaces.
+fn go_iface_methods(index: &Index, p: usize, t: &str, depth: u8) -> Vec<String> {
+    let mut out: Vec<String> = index.go.iface.get(&(p, t)).into_iter().flatten().map(|s| s.to_string()).collect();
+    if depth < 4 {
+        for &(e, ef) in index.go.embeds.get(&(p, t)).into_iter().flatten() {
+            match go_resolve_text(index, ef, e) {
+                Some(GoType::Repo(ep, et, "interface")) => out.extend(go_iface_methods(index, ep, &et, depth + 1)),
+                Some(GoType::External(x)) => {
+                    if let Some((_, ms)) = GO_STD_INTERFACES.iter().find(|(n, _)| *n == x) {
+                        out.extend(ms.iter().map(|s| s.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Class-hierarchy analysis: methods named `m` on repo types whose method set covers `required`.
+fn go_implementers(index: &Index, required: &[String], m: &str) -> Vec<SymRef> {
+    let key = (required.join(","), m.to_string());
+    if let Some(hit) = index.go.cha_cache.borrow().get(&key) {
+        return hit.clone();
+    }
+    let mut out: Vec<SymRef> = Vec::new();
+    for (&(p, t), set) in &index.go.method_sets {
+        if set.contains(m) && required.iter().all(|r| set.contains(r.as_str())) {
+            out.extend(index.go.methods.get(&(p, t, m)).into_iter().flatten().copied());
+        }
+    }
+    out.sort_unstable();
+    index.go.cha_cache.borrow_mut().insert(key, out.clone());
+    out
+}
+
+/// Ruby classes and modules by qualified name (a class reopened in several files is one class),
+/// their methods, and their ancestors from `<`, `include`, `extend` and `prepend`.
+#[derive(Default)]
+struct RubyModel<'a> {
+    classes: HashSet<&'a str>,
+    /// (class, @ivar) -> type assigned in that class
+    ivars: HashMap<(&'a str, &'a str), &'a TypeExpr>,
+    methods: HashMap<(&'a str, &'a str), Vec<SymRef>>,
+    ancestors: HashMap<String, Vec<String>>,
+    descendants: HashMap<String, Vec<String>>,
+}
+
+impl<'a> RubyModel<'a> {
+    fn build(files: &'a [ParsedFile]) -> Self {
+        let mut m = Self::default();
+        let ruby = || files.iter().enumerate().filter(|(_, f)| f.language == Language::Ruby);
+        for (fi, f) in ruby() {
+            for (si, s) in f.symbols.iter().enumerate() {
+                match s.kind {
+                    "class" => {
+                        m.classes.insert(s.qualified_name.as_str());
+                    }
+                    "method" => m.methods.entry((scope_of(s), s.name.as_str())).or_default().push((fi, si)),
+                    _ => {}
+                }
+            }
+        }
+        for (_, f) in ruby() {
+            for (owner, ivar, ty) in &f.facts.fields {
+                m.ivars.insert((owner.as_str(), ivar.as_str()), ty);
+            }
+            for rel in &f.impls {
+                // the innermost class/module named `type_name` around the relation's line
+                let owner = f
+                    .symbols
+                    .iter()
+                    .filter(|s| {
+                        s.kind == "class"
+                            && s.name == rel.type_name
+                            && s.start_line <= rel.line
+                            && rel.line <= s.end_line
+                    })
+                    .min_by_key(|s| s.end_line - s.start_line);
+                let Some(owner) = owner else { continue };
+                let Some(anc) = m.resolve_const(&rel.trait_name, &owner.qualified_name) else { continue };
+                if anc == owner.qualified_name {
+                    continue;
+                }
+                m.ancestors.entry(owner.qualified_name.clone()).or_default().push(anc.clone());
+                m.descendants.entry(anc).or_default().push(owner.qualified_name.clone());
+            }
+        }
+        m
+    }
+
+    /// Ruby constant lookup: the lexical nesting from innermost outwards, then a unique suffix match.
+    fn resolve_const(&self, path: &str, nesting: &str) -> Option<String> {
+        let path = path.trim().trim_start_matches("::");
+        let mut scope = nesting;
+        loop {
+            let candidate = if scope.is_empty() { path.to_string() } else { format!("{scope}::{path}") };
+            if self.classes.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+            if scope.is_empty() {
+                break;
+            }
+            scope = scope.rsplit_once("::").map_or("", |(outer, _)| outer);
+        }
+        let suffix = format!("::{path}");
+        let mut hits = self.classes.iter().filter(|c| c.ends_with(&suffix));
+        match (hits.next(), hits.next()) {
+            (Some(one), None) => Some(one.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The type assigned to `ivar` in `class` or the nearest ancestor that assigns it, with that
+    /// class (the constant's lexical context).
+    fn ivar_type(&self, class: &str, ivar: &str) -> Option<(String, &'a TypeExpr)> {
+        self.walk(class, &self.ancestors, |c| self.ivars.get(&(c, ivar)).map(|t| (c.to_string(), *t)))
+    }
+
+    /// The methods named `name` on the nearest class in `class`'s ancestry (itself first).
+    fn lookup(&self, class: &str, name: &str) -> Vec<SymRef> {
+        self.walk(class, &self.ancestors, |c| self.methods.get(&(c, name)).filter(|v| !v.is_empty()).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Methods named `name` in classes that inherit or mix in `class` (a module's host classes, a
+    /// base class's overrides).
+    fn descendant_methods(&self, class: &str, name: &str) -> Vec<SymRef> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::from([class]);
+        let mut queue: Vec<&str> = vec![class];
+        while let Some(c) = queue.pop() {
+            for d in self.descendants.get(c).into_iter().flatten() {
+                if seen.len() < 64 && seen.insert(d.as_str()) {
+                    if let Some(v) = self.methods.get(&(d.as_str(), name)) {
+                        out.extend(v.iter().copied());
+                    }
+                    queue.push(d.as_str());
+                }
+            }
+        }
+        out
+    }
+
+    fn walk<T>(
+        &self,
+        start: &str,
+        edges: &HashMap<String, Vec<String>>,
+        mut visit: impl FnMut(&str) -> Option<T>,
+    ) -> Option<T> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue = std::collections::VecDeque::from([start.to_string()]);
+        while let Some(c) = queue.pop_front() {
+            if !seen.insert(c.clone()) || seen.len() > 64 {
+                continue;
+            }
+            if let Some(hit) = visit(&c) {
+                return Some(hit);
+            }
+            queue.extend(edges.get(&c).into_iter().flatten().cloned());
+        }
+        None
+    }
+}
+
 fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
     let mut acc = EdgeAcc { edges: BTreeMap::new() };
     let mut entrypoints = HashSet::new();
@@ -426,51 +1251,10 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
                 continue;
             };
             let name = index.aliases[fi].get(call.target_name.as_str()).copied().unwrap_or(call.target_name.as_str());
-            // A bare `f(..)` or bare identifier argument can only name a free function; methods need a
-            // receiver or qualifier (`x.f()`, `Self::f`, `self.f`).
-            //
-            // Ruby is the exception: a receiver-less call inside a class is a self-call to one of its
-            // methods, and a symbol argument (`before_action :authorize`) names a method too.
-            let ruby_self = file.language == Language::Ruby && call.receiver.is_none();
-            let kinds: &[&str] = if call.receiver.is_none() && !ruby_self { &["fn"] } else { CALLABLE };
-            let mut cands = index.candidates(name, kinds);
-            if cands.is_empty() {
-                continue;
-            }
-            if ruby_self {
-                // Same-class tier first; otherwise fall back to the generic tiers (inherited methods,
-                // mixins and top-level functions all resolve heuristically).
-                let own: Vec<SymRef> = cands
-                    .iter()
-                    .copied()
-                    .filter(|&r| index.sym(r).kind == "method" && scope_of(index.sym(r)) == own_scope(caller))
-                    .collect();
-                if !own.is_empty() {
-                    cands = own;
-                }
-            }
-            if file.language == Language::Go && call.receiver.is_none() {
-                // An unqualified Go name is declared in the caller's own package or a dot-import.
-                cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0));
-                if cands.is_empty() {
-                    continue;
-                }
-            }
-            if let Some(r) = &call.receiver {
-                cands = narrow_by_receiver(index, caller, fi, r, cands);
-            }
-
-            let resolved = match call.kind {
-                // Macro identifiers are only trusted when defined locally or imported (§10.3).
-                CallKind::MacroIdent => {
-                    let near: Vec<SymRef> = cands
-                        .iter()
-                        .copied()
-                        .filter(|r| r.0 == fi || index.imported_files[fi].contains(&r.0))
-                        .collect();
-                    (!near.is_empty() && near.len() <= MAX_HEURISTIC_CANDIDATES).then_some((near, Tier::Heuristic))
-                }
-                _ => pick_tier(index, fi, &cands),
+            let resolved = match (file.language == Language::Ruby).then(|| resolve_ruby(index, caller, fi, call, name))
+            {
+                Some(Some(r)) => r,
+                _ => resolve_generic(index, file, fi, caller, call, name),
             };
             let Some((targets, mut tier)) = resolved else {
                 continue;
@@ -502,7 +1286,14 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
         for rel in &file.impls {
             let owners: Vec<SymRef> =
                 index.candidates(&rel.type_name, TYPES).into_iter().filter(|r| r.0 == fi).collect();
-            let supers = index.candidates(&rel.trait_name, TYPES);
+            let last = rel.trait_name.rsplit(['.', ':']).next().unwrap_or(&rel.trait_name);
+            let mut supers = index.candidates(last, TYPES);
+            if file.language == Language::Ruby {
+                let nesting = owners.first().map_or("", |o| index.sym(*o).qualified_name.as_str());
+                let Some(full) = index.ruby.resolve_const(&rel.trait_name, nesting) else { continue };
+                supers.retain(|r| index.sym(*r).qualified_name == full);
+                supers.truncate(1); // a class reopened in several files is still one class
+            }
             let Some((targets, tier)) = pick_tier(index, fi, &supers) else {
                 continue;
             };
@@ -528,7 +1319,18 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
             let Some(&owner) = by_id.get(tr.from_symbol_id.as_str()) else {
                 continue;
             };
-            let cands = index.candidates(&tr.type_name, TYPES);
+            let mut cands = index.candidates(&tr.type_name, TYPES);
+            if file.language == Language::Go {
+                // Go types are package-scoped: `T` is the caller's package (or a dot-import), `pkg.T`
+                // that import's package, and nothing for a package outside the repo.
+                match &tr.qualifier {
+                    Some(q) => {
+                        let pkg = index.go_imports[fi].get(q.as_str());
+                        cands.retain(|r| pkg.is_some_and(|p| p.contains(&r.0)));
+                    }
+                    None => cands.retain(|r| index.same_go_package(r.0, fi) || index.go_dot_imports[fi].contains(&r.0)),
+                }
+            }
             let Some((targets, tier)) = pick_tier(index, fi, &cands) else {
                 continue;
             };
@@ -801,6 +1603,114 @@ mod tests {
         assert_eq!(to("lib/util.rb", "util").map(|e| e.confidence), Some("STATIC_EXACT"));
         assert!(to("util.rb", "util").is_none());
         assert_eq!(join_relative("app/models", "../lib", "x"), "app/lib/x");
+    }
+
+    #[test]
+    fn go_receivers_are_typed_from_params_locals_fields_and_results() {
+        let mut files = vec![
+            parse_as(
+                "store/store.go",
+                Language::Go,
+                "package store\ntype Store struct{}\nfunc New() *Store { return &Store{} }\nfunc (s *Store) Save() {}\n",
+            ),
+            parse_as(
+                "app/app.go",
+                Language::Go,
+                "package app\nimport (\n\t\"testing\"\n\t\"example.com/m/store\"\n)\ntype Server struct{ db *store.Store; name string }\ntype Other struct{}\nfunc (o *Other) Save() {}\nfunc (s *Server) Run(t *testing.T) {\n\ts.db.Save()\n\tx := store.New()\n\tx.Save()\n\tt.Errorf(\"x\")\n\tfor _, tt := range []struct{ name string }{{\"a\"}} {\n\t\tuse(tt.name)\n\t}\n}\nfunc use(string) {}\n",
+            ),
+        ];
+        let edges = link(&mut files);
+        let run = id(&files, "Run");
+        let save_store = files[0].symbols.iter().find(|s| s.name == "Save").unwrap().symbol_id.clone();
+        let save_other = files[1].symbols.iter().find(|s| s.name == "Save").unwrap().symbol_id.clone();
+        let to_store: Vec<_> = edges.iter().filter(|e| e.from == run && e.to == save_store).collect();
+        assert_eq!(to_store.len(), 1, "{edges:#?}");
+        assert_eq!(to_store[0].confidence, "STATIC_EXACT");
+        assert_eq!(to_store[0].lines.len(), 2, "field chain and local from a constructor");
+        assert!(!edges.iter().any(|e| e.from == run && e.to == save_other), "typed receivers never guess");
+        assert!(edges.iter().filter(|e| e.from == run).all(|e| e.confidence == "STATIC_EXACT"), "{edges:#?}");
+    }
+
+    #[test]
+    fn go_interface_calls_reach_only_implementers() {
+        let mut files = vec![parse_as(
+            "p/p.go",
+            Language::Go,
+            "package p\ntype Saver interface{ Save(); Flush() }\ntype A struct{}\nfunc (a *A) Save() {}\nfunc (a *A) Flush() {}\ntype B struct{}\nfunc (b *B) Save() {}\nfunc Run(s Saver) { s.Save() }\n",
+        )];
+        let edges = link(&mut files);
+        let calls: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "Run") && e.kind == "CALLS").collect();
+        assert_eq!(calls.len(), 1, "B lacks Flush, so it is not a Saver: {calls:#?}");
+        assert!(calls[0].to.contains("::A::Save#"));
+        assert_eq!(calls[0].confidence, "STATIC_HEURISTIC", "interface dispatch stays a guess");
+    }
+
+    #[test]
+    fn go_platform_variants_resolve_to_the_default_build() {
+        let mut files = vec![
+            parse_as("p/run.go", Language::Go, "package p\nfunc Run() { lock() }\n"),
+            parse_as("p/lock_linux.go", Language::Go, "package p\nfunc lock() {}\n"),
+            parse_as("p/lock_windows.go", Language::Go, "package p\nfunc lock() {}\n"),
+            parse_as("p/lock_other.go", Language::Go, "//go:build !linux && !windows\n\npackage p\nfunc lock() {}\n"),
+        ];
+        let edges = link(&mut files);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == "CALLS").collect();
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        assert!(calls[0].to.starts_with("p/lock_linux.go::"), "{}", calls[0].to);
+        assert_eq!(calls[0].confidence, "STATIC_EXACT");
+        assert!(go_constraint_holds("linux && (amd64 || arm64)"));
+        assert!(!go_constraint_holds("darwin || windows"));
+        assert!(go_constraint_holds("!windows && go1.21"));
+    }
+
+    #[test]
+    fn go_type_refs_respect_package_scope() {
+        let mut files = vec![
+            parse_as("a/a.go", Language::Go, "package a\ntype Package struct{}\n"),
+            parse_as("b/b.go", Language::Go, "package b\ntype Package struct{}\n"),
+            parse_as(
+                "c/c.go",
+                Language::Go,
+                "package c\nimport \"example.com/m/a\"\nimport \"go/build\"\nfunc F(p *a.Package, q *build.Package) {}\n",
+            ),
+        ];
+        let edges = link(&mut files);
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == "PASSES_TYPE").collect();
+        assert_eq!(refs.len(), 1, "{refs:#?}");
+        assert!(refs[0].to.starts_with("a/a.go::"));
+        assert_eq!(refs[0].confidence, "STATIC_EXACT");
+    }
+
+    #[test]
+    fn ruby_constants_ancestors_and_locals_resolve_through_the_class_model() {
+        let mut files = vec![
+            parse_as(
+                "lib/base.rb",
+                Language::Ruby,
+                "module Greets\n  def greet; end\n  def host_hook; hook(); end\nend\nclass Base\n  def shared; end\nend\n",
+            ),
+            parse_as(
+                "lib/shop.rb",
+                Language::Ruby,
+                "class Cart < Base\n  include Greets\n  def initialize(x); end\n  def self.build; end\n  def build; end\n  def hook; end\n  def total; end\n  def run\n    shared()\n    greet()\n    Cart.build()\n    c = Cart.new(1)\n    c.total()\n    File.read('x')\n  end\nend\nclass Other\n  def total; end\n  def shared; end\nend\n",
+            ),
+        ];
+        let edges = link(&mut files);
+        let from_run: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "run") && e.kind == "CALLS").collect();
+        let to = |q: &str| from_run.iter().find(|e| e.to.contains(q)).map(|e| e.confidence);
+        assert_eq!(to("::Base::shared#"), Some("STATIC_EXACT"), "inherited: {from_run:#?}");
+        assert_eq!(to("::Greets::greet#"), Some("STATIC_EXACT"), "mixed in");
+        assert_eq!(to("::Cart::initialize#"), Some("STATIC_EXACT"), "Cart.new");
+        assert_eq!(to("::Cart::total#"), Some("STATIC_EXACT"), "local typed by Cart.new");
+        assert!(to("::Other::").is_none(), "an unrelated class is never a candidate: {from_run:#?}");
+        let builds: Vec<_> = from_run.iter().filter(|e| e.to.contains("::Cart::build#")).collect();
+        assert_eq!(builds.len(), 1, "Cart.build is the class method only");
+        assert_eq!(builds[0].confidence, "STATIC_EXACT");
+        assert!(from_run.iter().all(|e| !e.to.contains("read")), "File is not a repo class");
+        // a module's self call reaches the classes that include it
+        let hook = edges.iter().find(|e| e.from == id(&files, "host_hook")).expect("module -> host class");
+        assert!(hook.to.contains("::Cart::hook#"));
+        assert_eq!(hook.confidence, "STATIC_HEURISTIC");
     }
 
     #[test]

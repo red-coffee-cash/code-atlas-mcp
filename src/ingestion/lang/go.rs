@@ -4,7 +4,7 @@ use anyhow::Result;
 use tree_sitter::Node;
 
 use super::{Compiled, Frontend, own_line, text};
-use crate::ingestion::model::ImportDecl;
+use crate::ingestion::model::{ImportDecl, TypeExpr, TypeFacts};
 use crate::ingestion::walker::SourceFile;
 
 pub struct GoFrontend {
@@ -128,6 +128,74 @@ impl Frontend for GoFrontend {
         matches!(node.kind(), "function_declaration" | "method_declaration")
     }
 
+    fn receiver_type(&self, receiver: Node, src: &[u8]) -> Option<TypeExpr> {
+        expr_type(receiver, src, 0)
+    }
+
+    fn type_facts(&self, root: Node, src: &[u8]) -> TypeFacts {
+        let mut facts = TypeFacts::default();
+        let mut cursor = root.walk();
+        for decl in root.named_children(&mut cursor) {
+            match decl.kind() {
+                "comment" if facts.build_constraint.is_none() => {
+                    facts.build_constraint =
+                        text(decl, src).strip_prefix("//go:build").map(|expr| expr.trim().to_string());
+                }
+                "type_declaration" => {
+                    let mut c = decl.walk();
+                    for spec in decl.named_children(&mut c).filter(|n| n.kind() == "type_spec") {
+                        let (Some(name), Some(ty)) =
+                            (spec.child_by_field_name("name"), spec.child_by_field_name("type"))
+                        else {
+                            continue;
+                        };
+                        record_type(text(name, src), ty, src, &mut facts);
+                    }
+                }
+                "function_declaration" | "method_declaration" => {
+                    let owner = receiver_type(decl, src).unwrap_or_default();
+                    let (Some(name), Some(result)) =
+                        (decl.child_by_field_name("name"), decl.child_by_field_name("result"))
+                    else {
+                        continue;
+                    };
+                    let first = if result.kind() == "parameter_list" {
+                        result.named_child(0).and_then(|p| p.child_by_field_name("type"))
+                    } else {
+                        Some(result)
+                    };
+                    if let Some(t) = first {
+                        facts.results.push((owner, text(name, src).to_string(), text(t, src).to_string()));
+                    }
+                }
+                "var_declaration" => {
+                    let mut c = decl.walk();
+                    let specs: Vec<Node> = decl
+                        .named_children(&mut c)
+                        .flat_map(|n| if n.kind() == "var_spec_list" { named(n) } else { vec![n] })
+                        .filter(|n| n.kind() == "var_spec")
+                        .collect();
+                    for spec in specs {
+                        let names: Vec<Node> = spec.children_by_field_name("name", &mut spec.walk()).collect();
+                        let values = spec.child_by_field_name("value").map(named).unwrap_or_default();
+                        for (i, n) in names.iter().enumerate() {
+                            let ty = match spec.child_by_field_name("type") {
+                                Some(t) => Some(TypeExpr::Named(text(t, src).to_string())),
+                                None if values.len() == names.len() => expr_type(values[i], src, 0),
+                                None => None,
+                            };
+                            if let Some(ty) = ty {
+                                facts.vars.push((text(*n, src).to_string(), ty));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        facts
+    }
+
     fn flatten_import(&self, node: Node, src: &[u8], out: &mut Vec<ImportDecl>) {
         if node.kind() != "import_spec" {
             return;
@@ -148,6 +216,208 @@ impl Frontend for GoFrontend {
             }
             None => out.push(ImportDecl { module_path: path, name: last, alias: None }),
         }
+    }
+}
+
+fn named(n: Node) -> Vec<Node> {
+    let mut c = n.walk();
+    n.named_children(&mut c).filter(|x| x.kind() != "comment").collect()
+}
+
+fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
+    match ty.kind() {
+        "struct_type" => {
+            let Some(list) = named(ty).into_iter().find(|n| n.kind() == "field_declaration_list") else {
+                return;
+            };
+            for field in named(list).into_iter().filter(|n| n.kind() == "field_declaration") {
+                let Some(ft) = field.child_by_field_name("type") else { continue };
+                let names: Vec<Node> = field.children_by_field_name("name", &mut field.walk()).collect();
+                if names.is_empty() {
+                    facts.embeds.push((name.to_string(), text(ft, src).to_string()));
+                }
+                for n in names {
+                    facts.fields.push((
+                        name.to_string(),
+                        text(n, src).to_string(),
+                        TypeExpr::Named(text(ft, src).to_string()),
+                    ));
+                }
+            }
+        }
+        "interface_type" => {
+            for m in named(ty) {
+                match m.kind() {
+                    "method_elem" => {
+                        if let Some(n) = m.child_by_field_name("name") {
+                            facts.iface_methods.push((name.to_string(), text(n, src).to_string()));
+                        }
+                    }
+                    "type_elem" => facts.embeds.push((name.to_string(), text(m, src).to_string())),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The type of an expression, as far as the enclosing function shows it.
+fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
+    if depth > 8 {
+        return None;
+    }
+    let d = depth + 1;
+    let field = |f: &str| n.child_by_field_name(f);
+    match n.kind() {
+        "identifier" => match binding(n, src, d) {
+            Binding::Typed(t) => Some(t),
+            Binding::Untyped => None,
+            Binding::Unbound => Some(TypeExpr::Ident(text(n, src).to_string())),
+        },
+        "selector_expression" => {
+            let operand = expr_type(field("operand")?, src, d)?;
+            Some(TypeExpr::Field(Box::new(operand), text(field("field")?, src).to_string()))
+        }
+        "call_expression" => {
+            let f = field("function")?;
+            if f.kind() == "identifier" && matches!(text(f, src), "new" | "make") {
+                let arg = field("arguments")?.named_child(0)?;
+                return Some(TypeExpr::Named(text(arg, src).to_string()));
+            }
+            Some(TypeExpr::Call(Box::new(expr_type(f, src, d)?)))
+        }
+        "composite_literal" | "type_assertion_expression" => {
+            Some(TypeExpr::Named(text(field("type")?, src).to_string()))
+        }
+        "unary_expression" => {
+            let inner = expr_type(field("operand")?, src, d)?;
+            // `&x` and `*x` keep the named type; `<-ch` is the channel's element
+            let op = field("operator").map_or("", |o| text(o, src));
+            Some(if op == "<-" { TypeExpr::Elem(Box::new(inner)) } else { inner })
+        }
+        "parenthesized_expression" => expr_type(n.named_child(0)?, src, d),
+        "index_expression" => Some(TypeExpr::Elem(Box::new(expr_type(field("operand")?, src, d)?))),
+        "slice_expression" => expr_type(field("operand")?, src, d),
+        _ => None,
+    }
+}
+
+enum Binding {
+    /// Declared with a known type.
+    Typed(TypeExpr),
+    /// Declared locally, type not derivable; shadows any package-level name.
+    Untyped,
+    /// No local declaration: an import, or a package-level name.
+    Unbound,
+}
+
+/// The nearest declaration of `ident` visible at its position: an earlier statement in an
+/// enclosing block, an `if`/`for`/`switch` header, a type-switch case, or a parameter.
+fn binding(ident: Node, src: &[u8], depth: u8) -> Binding {
+    let name = text(ident, src);
+    if name == "_" {
+        return Binding::Untyped;
+    }
+    let before = |n: Node| n.end_byte() <= ident.start_byte();
+    let mut child = ident;
+    let mut cur = ident.parent();
+    while let Some(scope) = cur {
+        let found = match scope.kind() {
+            "statement_list" | "block" => named(scope)
+                .into_iter()
+                .filter(|c| before(*c))
+                .filter_map(|c| declares(c, name, src, depth))
+                .next_back(),
+            "if_statement" | "expression_switch_statement" | "type_switch_statement" | "for_statement" => {
+                let header = scope
+                    .child_by_field_name("initializer")
+                    .or_else(|| named(scope).into_iter().find(|c| matches!(c.kind(), "for_clause" | "range_clause")));
+                let header = header.and_then(|h| {
+                    if h.kind() == "for_clause" { h.child_by_field_name("initializer") } else { Some(h) }
+                });
+                let from_header = header.filter(|h| before(*h)).and_then(|h| declares(h, name, src, depth));
+                let alias = (scope.kind() == "type_switch_statement")
+                    .then(|| scope.child_by_field_name("alias"))
+                    .flatten()
+                    .filter(|a| named(*a).iter().any(|x| text(*x, src) == name));
+                match (alias, child.kind()) {
+                    // `switch v := x.(type) { case *T: v... }`: one type per case gives v that type
+                    (Some(_), "type_case") => {
+                        let types: Vec<Node> = child.children_by_field_name("type", &mut child.walk()).collect();
+                        Some(match types.as_slice() {
+                            [t] => Binding::Typed(TypeExpr::Named(text(*t, src).to_string())),
+                            _ => Binding::Untyped,
+                        })
+                    }
+                    (Some(_), _) => Some(Binding::Untyped),
+                    _ => from_header,
+                }
+            }
+            "function_declaration" | "method_declaration" | "func_literal" => {
+                let lists =
+                    ["receiver", "parameters", "result"].into_iter().filter_map(|f| scope.child_by_field_name(f));
+                lists.flat_map(named).find_map(|p| {
+                    let declared = p.children_by_field_name("name", &mut p.walk()).any(|n| text(n, src) == name);
+                    declared.then(|| match p.child_by_field_name("type") {
+                        Some(t) if p.kind() == "variadic_parameter_declaration" => {
+                            Binding::Typed(TypeExpr::Named(format!("[]{}", text(t, src))))
+                        }
+                        Some(t) => Binding::Typed(TypeExpr::Named(text(t, src).to_string())),
+                        None => Binding::Untyped,
+                    })
+                })
+            }
+            "source_file" => return Binding::Unbound,
+            _ => None,
+        };
+        if let Some(b) = found {
+            return b;
+        }
+        child = scope;
+        cur = scope.parent();
+    }
+    Binding::Unbound
+}
+
+/// What `decl` says about `name`, if it declares it.
+fn declares(decl: Node, name: &str, src: &[u8], depth: u8) -> Option<Binding> {
+    let typed = |t: Option<TypeExpr>| Some(t.map_or(Binding::Untyped, Binding::Typed));
+    match decl.kind() {
+        "short_var_declaration" => {
+            let left = named(decl.child_by_field_name("left")?);
+            let right = named(decl.child_by_field_name("right")?);
+            let i = left.iter().position(|l| text(*l, src) == name)?;
+            match (right.len() == left.len(), i) {
+                (true, _) => typed(expr_type(right[i], src, depth)),
+                // `v, err := f()` / `v, ok := m[k]`: only the first value's type is known
+                (false, 0) => typed(right.first().and_then(|r| expr_type(*r, src, depth))),
+                _ => Some(Binding::Untyped),
+            }
+        }
+        "range_clause" => {
+            let left = named(decl.child_by_field_name("left")?);
+            let i = left.iter().position(|l| text(*l, src) == name)?;
+            // the key (index) is untyped here; the value is the element of the ranged expression
+            let elem = decl.child_by_field_name("right").and_then(|r| expr_type(r, src, depth));
+            typed(if i == 1 { elem.map(|e| TypeExpr::Elem(Box::new(e))) } else { None })
+        }
+        "var_declaration" => {
+            let specs: Vec<Node> = named(decl)
+                .into_iter()
+                .flat_map(|n| if n.kind() == "var_spec_list" { named(n) } else { vec![n] })
+                .collect();
+            specs.into_iter().rev().find_map(|spec| {
+                let names: Vec<Node> = spec.children_by_field_name("name", &mut spec.walk()).collect();
+                let i = names.iter().position(|n| text(*n, src) == name)?;
+                if let Some(t) = spec.child_by_field_name("type") {
+                    return Some(Binding::Typed(TypeExpr::Named(text(t, src).to_string())));
+                }
+                let values = spec.child_by_field_name("value").map(named).unwrap_or_default();
+                typed(values.get(i).and_then(|v| expr_type(*v, src, depth)))
+            })
+        }
+        _ => None,
     }
 }
 

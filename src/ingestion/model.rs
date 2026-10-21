@@ -50,6 +50,41 @@ pub struct CallSite {
     pub kind: CallKind,
     /// For callbacks: the callee they were passed to (`get`, `map`, `route`, ...).
     pub via: Option<String>,
+    /// What the frontend could tell about the receiver's type from the caller's own code; the
+    /// linker finishes it with repo-wide facts (field types, function results).
+    pub receiver_type: Option<TypeExpr>,
+}
+
+/// A receiver's type as far as one file can tell. Resolved by the linker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeExpr {
+    /// A type as written: `*pkg.T`, `[]T`, `map[K]V`, `Foo::Bar`.
+    Named(String),
+    /// A name with no local binding: an import, or a package-level variable or function.
+    Ident(String),
+    /// `x.f`: a field of `x` (or a package member, when `x` is an import).
+    Field(Box<TypeExpr>, String),
+    /// The (first) result of calling the callee: `f()`, `x.m()`, `pkg.F()`.
+    Call(Box<TypeExpr>),
+    /// An element of a slice, array or map: `xs[i]`, the value of `range xs`.
+    Elem(Box<TypeExpr>),
+}
+
+/// Declarations the linker needs to type receivers across files.
+#[derive(Debug, Clone, Default)]
+pub struct TypeFacts {
+    /// (owner type, field, type): Go struct fields, Ruby instance variables.
+    pub fields: Vec<(String, String, TypeExpr)>,
+    /// (owner type, embedded type as written): Go struct embedding.
+    pub embeds: Vec<(String, String)>,
+    /// (interface, method) declared directly on a Go interface.
+    pub iface_methods: Vec<(String, String)>,
+    /// (receiver type or "" for a function, name, first result type as written).
+    pub results: Vec<(String, String, String)>,
+    /// Package-level variables: (name, type).
+    pub vars: Vec<(String, TypeExpr)>,
+    /// Go `//go:build` constraint expression, if the file has one.
+    pub build_constraint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +98,8 @@ pub struct TypeRef {
     pub from_symbol_id: String,
     pub type_name: String,
     pub kind: TypeRefKind,
+    /// Package qualifier as written (`load` in Go `*load.Package`); `None` when unqualified.
+    pub qualifier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,4 +133,5 @@ pub struct ParsedFile {
     /// Go only: the package's full import path (`github.com/acme/app/internal/auth`), derived from
     /// the nearest `go.mod` during sync. `None` when unknown.
     pub package_path: Option<String>,
+    pub facts: TypeFacts,
 }

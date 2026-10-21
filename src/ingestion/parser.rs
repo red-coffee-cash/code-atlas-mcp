@@ -59,6 +59,7 @@ pub fn parse_file(file: &SourceFile) -> Result<Option<ParsedFile>> {
         imports: Vec::new(),
         impls: fe.implements(root, src),
         package_path: None,
+        facts: fe.type_facts(root, src),
     };
 
     apply_risks(&compiled.risks, root, src, &mut symbols, &spans);
@@ -301,6 +302,11 @@ fn extract_calls(
                 from_symbol_id: symbols[i].sym.symbol_id.clone(),
                 type_name: text(t, src).to_string(),
                 kind,
+                qualifier: t
+                    .parent()
+                    .filter(|p| p.kind() == "qualified_type")
+                    .and_then(|p| p.child_by_field_name("package"))
+                    .map(|q| text(q, src).to_string()),
             });
             continue;
         }
@@ -323,6 +329,7 @@ fn extract_calls(
                 snippet: snippet(site, src),
                 kind: CallKind::Direct,
                 via: None,
+                receiver_type: cap("call.receiver").and_then(|r| fe.receiver_type(r, src)),
             });
         } else if let Some(r) = cap("call.callback_ref") {
             // `Self::handler`, `self.handler`, `mod.handler` carry a qualifier; a bare `handler`
@@ -346,6 +353,7 @@ fn extract_calls(
                 snippet: snippet(r.parent().unwrap_or(r), src),
                 kind: if symbol_ref { CallKind::SymbolRef } else { CallKind::Callback },
                 via: cap("call.callback_via").map(|v| last_segment(text(v, src)).to_string()),
+                receiver_type: if symbol_ref { None } else { qualifier.and_then(|q| fe.receiver_type(q, src)) },
             });
         } else if let (Some(name), Some(tokens)) = (cap("macro.name"), cap("macro.tokens")) {
             let macro_name = last_segment(text(name, src)).to_string();
@@ -365,6 +373,7 @@ fn extract_calls(
                         snippet: format!("{macro_name}!(…{}…)", text(n, src)),
                         kind: CallKind::MacroIdent,
                         via: Some(macro_name.clone()),
+                        receiver_type: None,
                     });
                 }
                 true

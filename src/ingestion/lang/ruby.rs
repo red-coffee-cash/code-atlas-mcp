@@ -4,7 +4,7 @@ use anyhow::Result;
 use tree_sitter::Node;
 
 use super::{Compiled, Frontend, own_line, text};
-use crate::ingestion::model::{ImplRel, ImportDecl};
+use crate::ingestion::model::{ImplRel, ImportDecl, TypeExpr, TypeFacts};
 use crate::ingestion::walker::SourceFile;
 
 pub struct RubyFrontend {
@@ -216,6 +216,30 @@ impl Frontend for RubyFrontend {
         matches!(node.kind(), "method" | "singleton_method" | "class" | "module")
     }
 
+    fn receiver_type(&self, receiver: Node, src: &[u8]) -> Option<TypeExpr> {
+        expr_type(receiver, src, 0)
+    }
+
+    /// `@x = Foo.new(..)` anywhere in a class types `@x` for the whole class.
+    fn type_facts(&self, root: Node, src: &[u8]) -> TypeFacts {
+        let mut facts = TypeFacts::default();
+        crate::ingestion::parser::walk(root, |n| {
+            if matches!(n.kind(), "assignment" | "operator_assignment")
+                && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
+                && l.kind() == "instance_variable"
+                && let Some(class) = enclosing_type(n)
+                && let Some(TypeExpr::Named(t)) = expr_type(r, src, 0)
+                && t != "self"
+            {
+                let mut chain = self.scope_chain(class, src);
+                chain.push(class.child_by_field_name("name").map_or("", |c| last_segment(text(c, src))).to_string());
+                facts.fields.push((chain.join("::"), text(l, src).to_string(), TypeExpr::Named(t)));
+            }
+            true
+        });
+        facts
+    }
+
     fn implements(&self, root: Node, src: &[u8]) -> Vec<ImplRel> {
         let mut out = Vec::new();
         crate::ingestion::parser::walk(root, |n| {
@@ -230,11 +254,7 @@ impl Frontend for RubyFrontend {
             if let Some(sup) = n.child_by_field_name("superclass").and_then(|s| s.named_child(0))
                 && matches!(sup.kind(), "constant" | "scope_resolution")
             {
-                out.push(ImplRel {
-                    type_name: type_name.clone(),
-                    trait_name: last_segment(text(sup, src)).to_string(),
-                    line,
-                });
+                out.push(ImplRel { type_name: type_name.clone(), trait_name: text(sup, src).to_string(), line });
             }
             if let Some(body) = n.child_by_field_name("body") {
                 let mut cursor = body.walk();
@@ -254,7 +274,7 @@ impl Frontend for RubyFrontend {
                     {
                         out.push(ImplRel {
                             type_name: type_name.clone(),
-                            trait_name: last_segment(text(a, src)).to_string(),
+                            trait_name: text(a, src).to_string(),
                             line: call.start_position().row + 1,
                         });
                     }
@@ -288,6 +308,63 @@ impl Frontend for RubyFrontend {
         let module_path = if relative { format!("./{module_path}") } else { module_path };
         out.push(ImportDecl { module_path, name, alias: None });
     }
+}
+
+/// The receiver's class as far as the enclosing method shows it: `Foo.new`, a local assigned
+/// from one, `self`, `self.class`, or an instance variable (typed by the class's assignments).
+fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
+    if depth > 6 {
+        return None;
+    }
+    match n.kind() {
+        "self" => Some(TypeExpr::Named("self".to_string())),
+        "instance_variable" => {
+            Some(TypeExpr::Field(Box::new(TypeExpr::Named("self".to_string())), text(n, src).to_string()))
+        }
+        "parenthesized_statements" => expr_type(n.named_child(0)?, src, depth + 1),
+        "call" => {
+            let method = text(n.child_by_field_name("method")?, src);
+            let receiver = n.child_by_field_name("receiver")?;
+            match (receiver.kind(), method) {
+                ("constant" | "scope_resolution", "new") => Some(TypeExpr::Named(text(receiver, src).to_string())),
+                ("self", "class") => Some(TypeExpr::Named("self.class".to_string())),
+                _ => None,
+            }
+        }
+        "identifier" => local_type(n, src, depth),
+        _ => None,
+    }
+}
+
+/// The type of the last assignment to a local before `ident` in its method; `None` for parameters,
+/// block variables and anything assigned from an expression of unknown type.
+fn local_type(ident: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
+    let name = text(ident, src);
+    let method = {
+        let mut cur = ident.parent();
+        while let Some(n) =
+            cur.filter(|n| !matches!(n.kind(), "method" | "singleton_method" | "class" | "module" | "program"))
+        {
+            cur = n.parent();
+        }
+        cur.filter(|n| matches!(n.kind(), "method" | "singleton_method"))?
+    };
+    let mut found = None;
+    crate::ingestion::parser::walk(method, |n| {
+        if n.start_byte() >= ident.start_byte() {
+            return false;
+        }
+        if matches!(n.kind(), "assignment" | "operator_assignment")
+            && let Some(l) = n.child_by_field_name("left")
+            && l.kind() == "identifier"
+            && text(l, src) == name
+            && n.end_byte() <= ident.start_byte()
+        {
+            found = Some(n.child_by_field_name("right").and_then(|r| expr_type(r, src, depth + 1)));
+        }
+        true
+    });
+    found.flatten()
 }
 
 fn keyword_level(name: &str) -> Option<&'static str> {
@@ -685,7 +762,7 @@ class Plain; end
 "#,
         );
         let rel: Vec<_> = p.impls.iter().map(|r| (r.type_name.as_str(), r.trait_name.as_str())).collect();
-        assert_eq!(rel, [("Bar", "Base"), ("Bar", "Mixin"), ("Bar", "Other"), ("Bar", "Wrap")]);
+        assert_eq!(rel, [("Bar", "Base"), ("Bar", "Mixin"), ("Bar", "Helpers::Other"), ("Bar", "Wrap")]);
     }
 
     #[test]
