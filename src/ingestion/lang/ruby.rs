@@ -428,7 +428,7 @@ impl Frontend for RubyFrontend {
 /// The receiver's class as far as the enclosing method shows it: `Foo.new`, a local assigned
 /// from one, `self`, `self.class`, or an instance variable (typed by the class's assignments).
 fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
-    if depth > 6 {
+    if depth > 32 {
         return None;
     }
     let core = |c: &str| Some(TypeExpr::Named(c.to_string()));

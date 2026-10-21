@@ -154,6 +154,16 @@ impl Frontend for GoFrontend {
                 }
                 "function_declaration" | "method_declaration" => {
                     let owner = receiver_type(decl, src).unwrap_or_default();
+                    if let (Some(name), Some(_), Some(body)) = (
+                        decl.child_by_field_name("name"),
+                        decl.child_by_field_name("result"),
+                        decl.child_by_field_name("body"),
+                    ) {
+                        let name = text(name, src).to_string();
+                        for value in returned_values(body, src) {
+                            facts.returns.push((owner.clone(), name.clone(), value));
+                        }
+                    }
                     let (Some(name), Some(result)) =
                         (decl.child_by_field_name("name"), decl.child_by_field_name("result"))
                     else {
@@ -197,6 +207,19 @@ impl Frontend for GoFrontend {
                 _ => {}
             }
         }
+        record_field_flows(root, src, &mut facts);
+        // types declared inside functions: not symbols, but part of the package's type model
+        crate::ingestion::parser::walk(root, |n| {
+            if n.kind() == "type_spec"
+                && n.parent().and_then(|d| d.parent()).is_some_and(|p| p.kind() != "source_file")
+                && let (Some(name), Some(ty)) = (n.child_by_field_name("name"), n.child_by_field_name("type"))
+            {
+                let kind = if ty.kind() == "interface_type" { "interface" } else { "struct" };
+                facts.local_types.push((text(name, src).to_string(), kind));
+                record_type(text(name, src), ty, src, &mut facts);
+            }
+            true
+        });
         facts
     }
 
@@ -238,7 +261,12 @@ fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
                 let Some(ft) = field.child_by_field_name("type") else { continue };
                 let names: Vec<Node> = field.children_by_field_name("name", &mut field.walk()).collect();
                 if names.is_empty() {
-                    facts.embeds.push((name.to_string(), text(ft, src).to_string()));
+                    // an embedded field is also a field named after its type (`s.Conn` for `Conn`)
+                    let ty = text(ft, src);
+                    facts.embeds.push((name.to_string(), ty.to_string()));
+                    let field = ty.trim_start_matches('*').rsplit('.').next().unwrap_or(ty);
+                    let field = field.split('[').next().unwrap_or(field);
+                    facts.fields.push((name.to_string(), field.to_string(), TypeExpr::Named(ty.to_string())));
                 }
                 for n in names {
                     facts.fields.push((
@@ -276,9 +304,248 @@ fn record_type(name: &str, ty: Node, src: &[u8], facts: &mut TypeFacts) {
     }
 }
 
+/// Every first value a function body returns (nested func literals excluded), locals expanded to
+/// all values assigned to them. `None` entries are values of unknown type.
+fn returned_values(body: Node, src: &[u8]) -> Vec<Option<TypeExpr>> {
+    let mut out = Vec::new();
+    crate::ingestion::parser::walk(body, |n| {
+        if n.kind() == "func_literal" {
+            return false;
+        }
+        if n.kind() == "return_statement" {
+            match n.named_child(0).and_then(|l| named(l).into_iter().next()) {
+                // a bare return yields the named results' current values
+                None => {
+                    let func = body.parent();
+                    let first = func
+                        .and_then(|f| f.child_by_field_name("result"))
+                        .filter(|r| r.kind() == "parameter_list")
+                        .and_then(|r| r.named_child(0))
+                        .and_then(|p| p.child_by_field_name("name"));
+                    match (func, first) {
+                        (Some(f), Some(name)) => match assigned_values(f, text(name, src), src) {
+                            Some(vs) => out.extend(vs.into_iter().map(Some)),
+                            None => out.push(None),
+                        },
+                        _ => out.push(None),
+                    }
+                }
+                Some(v) => match value_flows(v, src) {
+                    Some(vs) => out.extend(vs.into_iter().map(Some)),
+                    None => out.push(None),
+                },
+            }
+        }
+        true
+    });
+    out
+}
+
+/// The typed values an expression can hold: `nil` none, a local everything assigned to it in its
+/// function, anything else its own type. `None` when any of them is untyped.
+fn value_flows(expr: Node, src: &[u8]) -> Option<Vec<TypeExpr>> {
+    if expr.kind() == "nil" || (expr.kind() == "identifier" && text(expr, src) == "nil") {
+        return Some(Vec::new());
+    }
+    if expr.kind() == "call_expression"
+        && let Some(f) = expr.child_by_field_name("function").filter(|f| f.kind() == "identifier")
+        && let Some(lit) = local_func_literal(f, src)
+    {
+        let body = lit.child_by_field_name("body")?;
+        return returned_values(body, src).into_iter().collect();
+    }
+    if expr.kind() != "identifier" {
+        return expr_type(expr, src, 0).map(|t| vec![t]);
+    }
+    let name = text(expr, src);
+    if matches!(binding(expr, src, 0), Binding::Unbound) {
+        return Some(vec![TypeExpr::Ident(name.to_string())]);
+    }
+    let mut func = expr.parent();
+    while let Some(f) =
+        func.filter(|f| !matches!(f.kind(), "function_declaration" | "method_declaration" | "func_literal"))
+    {
+        func = f.parent();
+    }
+    assigned_values(func?, name, src)
+}
+
+/// The func literal a local is bound to (`listen := func(..) T { .. }`), if it is only ever that.
+fn local_func_literal<'t>(ident: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let name = text(ident, src);
+    let mut func = ident.parent();
+    while let Some(f) = func.filter(|f| !matches!(f.kind(), "function_declaration" | "method_declaration")) {
+        func = f.parent();
+    }
+    let mut found = None;
+    let mut other = false;
+    crate::ingestion::parser::walk(func?, |n| {
+        if matches!(n.kind(), "short_var_declaration" | "assignment_statement")
+            && let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
+        {
+            let (l, r) = (named(l), named(r));
+            if let Some(i) = l.iter().position(|x| text(*x, src) == name) {
+                match r.get(i).filter(|v| v.kind() == "func_literal" && l.len() == r.len()) {
+                    Some(lit) if found.is_none() => found = Some(*lit),
+                    _ => other = true,
+                }
+            }
+        }
+        true
+    });
+    if other { None } else { found }
+}
+
+/// Everything assigned to local `name` in `func` (named results included: they start as zero
+/// values). `None` for parameters, whose values come from callers.
+fn assigned_values(func: Node, name: &str, src: &[u8]) -> Option<Vec<TypeExpr>> {
+    let is_param = ["receiver", "parameters"]
+        .into_iter()
+        .filter_map(|f| func.child_by_field_name(f))
+        .flat_map(named)
+        .any(|p| p.children_by_field_name("name", &mut p.walk()).any(|n| text(n, src) == name));
+    if is_param {
+        return None;
+    }
+    let mut values: Vec<Node> = Vec::new();
+    let mut unknown = false;
+    crate::ingestion::parser::walk(func, |n| {
+        let (left, right) = match n.kind() {
+            "short_var_declaration" | "assignment_statement" => {
+                if n.kind() == "assignment_statement"
+                    && n.child_by_field_name("operator").is_some_and(|o| text(o, src) != "=")
+                {
+                    return true;
+                }
+                (n.child_by_field_name("left").map(named), n.child_by_field_name("right").map(named))
+            }
+            "var_spec" => (
+                Some(n.children_by_field_name("name", &mut n.walk()).collect()),
+                n.child_by_field_name("value").map(named),
+            ),
+            "range_clause" => {
+                if n.child_by_field_name("left").is_some_and(|l| named(l).iter().any(|x| text(*x, src) == name)) {
+                    unknown = true;
+                }
+                return true;
+            }
+            _ => return true,
+        };
+        let (Some(left), right) = (left, right.unwrap_or_default()) else { return true };
+        if let Some(i) = left.iter().position(|l| l.kind() == "identifier" && text(*l, src) == name) {
+            match (right.len() == left.len(), i, right.first()) {
+                (true, _, _) => values.push(right[i]),
+                (false, 0, Some(r)) => values.push(*r),
+                (false, _, None) => {} // `var x T`: the zero value
+                _ => unknown = true,
+            }
+        }
+        true
+    });
+    if unknown {
+        return None;
+    }
+    let mut out = Vec::new();
+    for v in values {
+        if v.kind() == "nil" || text(v, src) == "nil" {
+            continue;
+        }
+        out.push(expr_type(v, src, 0)?);
+    }
+    Some(out)
+}
+
+/// Values stored into struct fields: keyed composite literals (`&S{L: ln}`) and `x.f = v`.
+/// Positional literals and stores into receivers of unknown type poison the field.
+fn record_field_flows(root: Node, src: &[u8], facts: &mut TypeFacts) {
+    crate::ingestion::parser::walk(root, |n| {
+        match n.kind() {
+            "composite_literal" => {
+                let ty = literal_type(n, src).map(TypeExpr::Named);
+                let elems = n.child_by_field_name("body").map(named).unwrap_or_default();
+                for e in &elems {
+                    if e.kind() == "keyed_element" {
+                        let key = e.child_by_field_name("key").and_then(|k| k.named_child(0));
+                        let value = e.child_by_field_name("value").and_then(|v| v.named_child(0));
+                        let (Some(key), Some(value)) = (key, value) else { continue };
+                        if key.kind() != "identifier" && key.kind() != "field_identifier" {
+                            continue;
+                        }
+                        let base = ty.clone().unwrap_or_else(|| TypeExpr::Ident("?".to_string()));
+                        record_flow(facts, base, text(key, src), value_flows(value, src));
+                    }
+                }
+                let positional = elems.iter().any(|e| e.kind() == "literal_element");
+                if positional && let Some(t) = &ty {
+                    facts.field_flows.push((t.clone(), "*".to_string(), None));
+                }
+            }
+            "assignment_statement" => {
+                let left = n.child_by_field_name("left").map(named).unwrap_or_default();
+                let right = n.child_by_field_name("right").map(named).unwrap_or_default();
+                for (i, l) in left.iter().enumerate().filter(|(_, l)| l.kind() == "selector_expression") {
+                    let (Some(operand), Some(field)) =
+                        (l.child_by_field_name("operand"), l.child_by_field_name("field"))
+                    else {
+                        continue;
+                    };
+                    let base = expr_type(operand, src, 0).unwrap_or_else(|| TypeExpr::Ident("?".to_string()));
+                    let value = if right.len() == left.len() { value_flows(right[i], src) } else { None };
+                    record_flow(facts, base, text(field, src), value);
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+}
+
+/// A composite literal's type, also when elided inside a slice, array or map literal
+/// (`[]T{{A: 1}}`, `map[string]T{"k": {A: 1}}`).
+fn literal_type(lit: Node, src: &[u8]) -> Option<String> {
+    if let Some(t) = lit.child_by_field_name("type") {
+        return Some(text(t, src).to_string());
+    }
+    // literal -> literal_element -> (keyed_element ->) literal_value -> outer composite literal
+    let elem = lit.parent().filter(|p| p.kind() == "literal_element")?;
+    let mut up = elem.parent()?;
+    if up.kind() == "keyed_element" {
+        if up.child_by_field_name("value").is_none_or(|v| v.id() != elem.id()) {
+            return None; // an elided map key
+        }
+        up = up.parent()?;
+    }
+    let outer = up.parent().filter(|o| o.kind() == "composite_literal")?;
+    let outer_ty = literal_type(outer, src)?;
+    let t = outer_ty.trim();
+    let elem_ty = if let Some(rest) = t.strip_prefix("map[") {
+        let mut depth = 1;
+        let close = rest.char_indices().find(|&(_, c)| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })?;
+        &rest[close.0 + 1..]
+    } else {
+        let close = t.strip_prefix('[').and_then(|r| r.find(']'))?;
+        &t[close + 2..]
+    };
+    Some(elem_ty.trim().trim_start_matches('*').to_string())
+}
+
+fn record_flow(facts: &mut TypeFacts, base: TypeExpr, field: &str, values: Option<Vec<TypeExpr>>) {
+    match values {
+        Some(vs) => facts.field_flows.extend(vs.into_iter().map(|v| (base.clone(), field.to_string(), Some(v)))),
+        None => facts.field_flows.push((base, field.to_string(), None)),
+    }
+}
+
 /// The type of an expression, as far as the enclosing function shows it.
 fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
-    if depth > 8 {
+    if depth > 48 {
         return None;
     }
     let d = depth + 1;
@@ -311,6 +578,12 @@ fn expr_type(n: Node, src: &[u8], depth: u8) -> Option<TypeExpr> {
             Some(if op == "<-" { TypeExpr::Elem(Box::new(inner)) } else { inner })
         }
         "parenthesized_expression" => expr_type(n.named_child(0)?, src, d),
+        // `func(a int) T { .. }`: its signature is its type
+        "func_literal" => {
+            let body = field("body")?;
+            let sig = String::from_utf8_lossy(&src[n.start_byte()..body.start_byte()]);
+            Some(TypeExpr::Named(sig.split_whitespace().collect::<Vec<_>>().join(" ")))
+        }
         "index_expression" => Some(TypeExpr::Elem(Box::new(expr_type(field("operand")?, src, d)?))),
         "slice_expression" => expr_type(field("operand")?, src, d),
         _ => None,
@@ -368,6 +641,20 @@ fn binding(ident: Node, src: &[u8], depth: u8) -> Binding {
                     _ => from_header,
                 }
             }
+            // `case res := <-results:`
+            "communication_case" => scope
+                .child_by_field_name("communication")
+                .filter(|c| c.kind() == "receive_statement" && before(*c))
+                .and_then(|c| {
+                    let left = named(c.child_by_field_name("left")?);
+                    let i = left.iter().position(|l| text(*l, src) == name)?;
+                    let right = c.child_by_field_name("right")?;
+                    Some(if i == 0 {
+                        expr_type(right, src, depth).map_or(Binding::Untyped, Binding::Typed)
+                    } else {
+                        Binding::Untyped
+                    })
+                }),
             "function_declaration" | "method_declaration" | "func_literal" => {
                 let lists =
                     ["receiver", "parameters", "result"].into_iter().filter_map(|f| scope.child_by_field_name(f));
@@ -412,9 +699,9 @@ fn declares(decl: Node, name: &str, src: &[u8], depth: u8) -> Option<Binding> {
         "range_clause" => {
             let left = named(decl.child_by_field_name("left")?);
             let i = left.iter().position(|l| text(*l, src) == name)?;
-            // the key (index) is untyped here; the value is the element of the ranged expression
-            let elem = decl.child_by_field_name("right").and_then(|r| expr_type(r, src, depth));
-            typed(if i == 1 { elem.map(|e| TypeExpr::Elem(Box::new(e))) } else { None })
+            // the first variable is an index, a map key or a channel element; the second the element
+            let ranged = decl.child_by_field_name("right").and_then(|r| expr_type(r, src, depth));
+            typed(ranged.map(|e| if i == 1 { TypeExpr::Elem(Box::new(e)) } else { TypeExpr::Key(Box::new(e)) }))
         }
         "var_declaration" => {
             let specs: Vec<Node> = named(decl)

@@ -572,7 +572,7 @@ fn ruby_receiver_class(
     ty: &TypeExpr,
     depth: u8,
 ) -> Option<Option<(String, bool)>> {
-    if depth > 6 {
+    if depth > 32 {
         return None;
     }
     let d = depth + 1;
@@ -602,7 +602,7 @@ fn ruby_receiver_class(
             let hit = rb.param_types.borrow().get(&(scope.to_string(), method.clone(), *i)).cloned()?;
             Some(Some(hit))
         }
-        TypeExpr::Elem(_) => None,
+        TypeExpr::Elem(_) | TypeExpr::Key(_) => None,
     }
 }
 
@@ -764,6 +764,28 @@ struct GoModel<'a> {
     default_build: Vec<bool>,
     /// per file: a `_test.go` file
     test_file: Vec<bool>,
+    /// (package, receiver type or "", function) -> values its `return`s yield (`None`: untyped)
+    returns: HashMap<(usize, &'a str, &'a str), Vec<Flow<'a>>>,
+    /// field name (or `*`) -> (struct expression, value stored, file)
+    field_flows: HashMap<&'a str, Vec<(&'a TypeExpr, Flow<'a>)>>,
+    /// memo for `go_dyn_types`; `None` while being computed (a cycle) or when unknown
+    dyn_cache: RefCell<HashMap<String, Option<DynTypes>>>,
+}
+
+/// A value flowing somewhere (`None`: untyped), with the file it is written in.
+type Flow<'a> = (Option<&'a TypeExpr>, usize);
+
+/// The repo struct types a value can dynamically have.
+#[derive(Clone, Debug, Default)]
+struct DynTypes {
+    types: std::collections::BTreeSet<(usize, String)>,
+}
+
+#[derive(Clone, Debug)]
+enum RangeKey {
+    Index,
+    Elem,
+    Of(String),
 }
 
 /// A resolved Go type.
@@ -773,8 +795,9 @@ enum GoType {
     Repo(usize, String, &'static str),
     /// A type from outside the repo (stdlib, third party, builtin), as written.
     External(String),
-    /// A slice, array, map or channel: its element type as written, in the given file's context.
-    Container(String, usize),
+    /// A slice, array, map or channel: its element type as written, in the given file's context,
+    /// and what the first variable of `range` over it is.
+    Container(String, usize, RangeKey),
     /// An imported package (its repo files; empty for an external package).
     Package(Vec<usize>),
 }
@@ -886,6 +909,9 @@ impl<'a> GoModel<'a> {
                 }
             }
             let facts = &f.facts;
+            for (name, kind) in &facts.local_types {
+                m.types.entry((p, name.as_str())).or_insert(kind);
+            }
             for (owner, field, ty) in &facts.fields {
                 m.fields.insert((p, owner.as_str(), field.as_str()), (ty, fi));
             }
@@ -902,6 +928,12 @@ impl<'a> GoModel<'a> {
             }
             for (name, ty) in &facts.vars {
                 m.vars.insert((p, name.as_str()), (ty, fi));
+            }
+            for (owner, name, value) in &facts.returns {
+                m.returns.entry((p, owner.as_str(), name.as_str())).or_default().push((value.as_ref(), fi));
+            }
+            for (base, field, value) in &facts.field_flows {
+                m.field_flows.entry(field.as_str()).or_default().push((base, (value.as_ref(), fi)));
             }
         }
         m
@@ -1059,10 +1091,16 @@ fn go_typed_call(index: &Index, fi: usize, rt: &TypeExpr, method: &str) -> Optio
     Some(match go_resolve(index, fi, rt, 0)? {
         GoType::Repo(p, t, "struct") => decide(go_in_build(index, fi, go_method(index, p, &t, method, 0)), Tier::Exact),
         GoType::Repo(p, t, _) => {
+            if let Some(dynamic) = go_dyn_types(index, fi, rt, 0) {
+                return Some(go_dyn_call(index, fi, &dynamic, method));
+            }
             let required = go_iface_methods(index, p, &t, 0);
             decide(go_in_build(index, fi, go_implementers(index, &required, method)), Tier::Heuristic)
         }
         GoType::External(t) => {
+            if let Some(dynamic) = go_dyn_types(index, fi, rt, 0) {
+                return Some(go_dyn_call(index, fi, &dynamic, method));
+            }
             let t = t.trim_start_matches('*');
             match GO_STD_INTERFACES.iter().find(|(name, _)| *name == t) {
                 Some((_, required)) => {
@@ -1076,12 +1114,175 @@ fn go_typed_call(index: &Index, fi: usize, rt: &TypeExpr, method: &str) -> Optio
     })
 }
 
+/// The first result of a func type as written: `func(a int) (*T, error)` -> `*T`.
+fn go_func_result(func: &str) -> Option<&str> {
+    let rest = func.trim().strip_prefix("func")?.trim_start();
+    // skip the parameter list
+    let mut depth = 0;
+    let mut end = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let results = rest[end?..].trim();
+    let first = match results.strip_prefix('(') {
+        Some(list) => {
+            let mut depth = 0;
+            let cut = list
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '(' | '[' | '{' => depth += 1,
+                        ')' | ']' | '}' if depth > 0 => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0 && (c == ',' || c == ')')
+                })
+                .map_or(list.len(), |(i, _)| i);
+            list[..cut].trim()
+        }
+        None => results,
+    };
+    // `(c Conn, err error)`: drop the result's name
+    let first = match first.split_once(' ') {
+        Some((n, t))
+            if !n.contains(['*', '[', '.'])
+                && !t.is_empty()
+                && !n.starts_with("func")
+                && !n.starts_with("chan")
+                && !n.starts_with("map") =>
+        {
+            t.trim()
+        }
+        _ => first,
+    };
+    (!first.is_empty()).then_some(first)
+}
+
+/// A call on an interface value whose dynamic types are known: the method of each, exact when
+/// they all share one (closed world: values stored by reflection or by code outside the repo
+/// are not seen).
+fn go_dyn_call(index: &Index, fi: usize, dynamic: &DynTypes, method: &str) -> Option<(Vec<SymRef>, Tier)> {
+    let mut targets: Vec<SymRef> = dynamic.types.iter().flat_map(|(p, t)| go_method(index, *p, t, method, 0)).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    decide(go_in_build(index, fi, targets), Tier::Exact)
+}
+
+/// The repo struct types an expression can dynamically hold, when every value that can flow
+/// into it is known: a struct-typed expression is itself; an interface-typed call result is the
+/// union over the function's returns; an interface-typed field the union over its stores.
+fn go_dyn_types(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<DynTypes> {
+    if depth > 24 {
+        return None;
+    }
+    let key = format!("{fi}:{expr:?}");
+    if let Some(hit) = index.go.dyn_cache.borrow().get(&key) {
+        return hit.clone();
+    }
+    index.go.dyn_cache.borrow_mut().insert(key.clone(), None); // cycle guard
+    let result = go_dyn_types_uncached(index, fi, expr, depth);
+    index.go.dyn_cache.borrow_mut().insert(key, result.clone());
+    result
+}
+
+fn go_dyn_types_uncached(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<DynTypes> {
+    let d = depth + 1;
+    match go_resolve(index, fi, expr, 0)? {
+        GoType::Repo(p, t, "struct") => {
+            return Some(DynTypes { types: [(p, t)].into() });
+        }
+        GoType::Repo(..) | GoType::External(_) => {}
+        _ => return None,
+    }
+    let union = |flows: &[(Option<&TypeExpr>, usize)]| -> Option<DynTypes> {
+        let mut out = DynTypes::default();
+        if flows.is_empty() {
+            return None;
+        }
+        for &(value, vf) in flows {
+            out.types.extend(go_dyn_types(index, vf, value?, d)?.types);
+        }
+        Some(out)
+    };
+    match expr {
+        TypeExpr::Call(callee) => {
+            let key = match callee.as_ref() {
+                TypeExpr::Ident(f) => (index.go.pkg[fi]?, String::new(), f.clone()),
+                TypeExpr::Field(base, m) => match go_resolve(index, fi, base, 0)? {
+                    GoType::Package(files) => (index.go.pkg[*files.first()?]?, String::new(), m.clone()),
+                    GoType::Repo(p, t, "struct") => (p, t, m.clone()),
+                    // a method of an interface value: the union of what that method returns on
+                    // every type the value can hold (its own dynamic types, else every implementer)
+                    GoType::Repo(p, t, _) => {
+                        let impls = match go_dyn_types(index, fi, base, d) {
+                            Some(dynamic) => {
+                                dynamic.types.iter().flat_map(|(dp, dt)| go_method(index, *dp, dt, m, 0)).collect()
+                            }
+                            None => go_implementers(index, &go_iface_methods(index, p, &t, 0), m),
+                        };
+                        let mut out = DynTypes::default();
+                        for r in go_in_build(index, fi, impls) {
+                            let sym = index.sym(r);
+                            let owner = scope_of(sym);
+                            let rp = index.go.pkg[r.0]?;
+                            let flows = index.go.returns.get(&(rp, owner, sym.name.as_str()))?;
+                            out.types.extend(union(flows)?.types);
+                        }
+                        return (!out.types.is_empty()).then_some(out);
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let flows = index.go.returns.get(&(key.0, key.1.as_str(), key.2.as_str()))?;
+            union(flows)
+        }
+        TypeExpr::Field(base, f) => {
+            let GoType::Repo(p, t, "struct") = go_resolve(index, fi, base, 0)? else { return None };
+            let mut flows: Vec<(Option<&TypeExpr>, usize)> = Vec::new();
+            for name in [f.as_str(), "*"] {
+                for &(b, (value, vf)) in index.go.field_flows.get(name).into_iter().flatten() {
+                    let same = match b {
+                        TypeExpr::Ident(q) if q == "?" => true, // a store through an untyped value
+                        _ => matches!(go_resolve(index, vf, b, 0), Some(GoType::Repo(bp, bt, _)) if bp == p && bt == t),
+                    };
+                    if same {
+                        flows.push((value, vf));
+                    }
+                }
+            }
+            union(&flows)
+        }
+        TypeExpr::Ident(n) => {
+            let &(ty, vf) = index.go.vars.get(&(index.go.pkg[fi]?, n.as_str()))?;
+            go_dyn_types(index, vf, ty, d)
+        }
+        _ => None,
+    }
+}
+
 /// A named type as written (`*pkg.T`, `[]T`, `map[K]V`), in the context of file `fi`.
 fn go_resolve_text(index: &Index, fi: usize, text: &str) -> Option<GoType> {
     let t = text.trim().trim_start_matches('*').trim();
-    for prefix in ["[]", "chan ", "<-chan ", "chan<- ", "..."] {
+    for (prefix, key) in [
+        ("[]", RangeKey::Index),
+        ("...", RangeKey::Index),
+        ("chan ", RangeKey::Elem),
+        ("<-chan ", RangeKey::Elem),
+        ("chan<- ", RangeKey::Elem),
+    ] {
         if let Some(rest) = t.strip_prefix(prefix) {
-            return Some(GoType::Container(rest.to_string(), fi));
+            return Some(GoType::Container(rest.to_string(), fi, key));
         }
     }
     if t.starts_with('[') || t.starts_with("map[") {
@@ -1094,7 +1295,11 @@ fn go_resolve_text(index: &Index, fi: usize, text: &str) -> Option<GoType> {
                 ']' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(GoType::Container(t[open + i + 1..].to_string(), fi));
+                        let key = match t.strip_prefix("map[") {
+                            Some(_) => RangeKey::Of(t[open + 1..open + i].to_string()),
+                            None => RangeKey::Index,
+                        };
+                        return Some(GoType::Container(t[open + i + 1..].to_string(), fi, key));
                     }
                 }
                 _ => {}
@@ -1138,7 +1343,7 @@ fn go_resolve_text(index: &Index, fi: usize, text: &str) -> Option<GoType> {
 }
 
 fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<GoType> {
-    if depth > 12 {
+    if depth > 48 {
         return None;
     }
     let d = depth + 1;
@@ -1172,8 +1377,13 @@ fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<Go
                 if let Some(t) = go_resolve_text(index, fi, f) {
                     return Some(t);
                 }
-                let &(ty, rf) = index.go.results.get(&(p, "", f.as_str()))?;
-                go_resolve_text(index, rf, ty)
+                if let Some(&(ty, rf)) = index.go.results.get(&(p, "", f.as_str())) {
+                    return go_resolve_text(index, rf, ty);
+                }
+                // a func-typed package variable
+                let &(ty, vf) = index.go.vars.get(&(p, f.as_str()))?;
+                let TypeExpr::Named(func) = ty else { return None };
+                go_resolve_text(index, vf, go_func_result(func)?)
             }
             TypeExpr::Field(base, m) => match go_resolve(index, fi, base, d)? {
                 GoType::Package(files) => {
@@ -1187,17 +1397,31 @@ fn go_resolve(index: &Index, fi: usize, expr: &TypeExpr, depth: u8) -> Option<Go
                     let &(ty, rf) = index.go.results.get(&(qp, "", m.as_str()))?;
                     go_resolve_text(index, rf, ty)
                 }
-                GoType::Repo(tp, t, _) => {
-                    let (ty, rf) = go_result(index, tp, &t, m, 0)?;
-                    go_resolve_text(index, rf, ty)
-                }
+                GoType::Repo(tp, t, kind) => match go_result(index, tp, &t, m, 0) {
+                    Some((ty, rf)) => go_resolve_text(index, rf, ty),
+                    // not a method: a func-typed field (`sd.testHook(..)`) returns what its type says
+                    None if kind == "struct" => {
+                        let (ty, ff) = go_field(index, tp, &t, m, 0)?;
+                        let TypeExpr::Named(func) = ty else { return None };
+                        go_resolve_text(index, ff, go_func_result(func)?)
+                    }
+                    None => None,
+                },
                 GoType::External(t) => Some(GoType::External(format!("{t}.{m}()?"))),
                 GoType::Container(..) => None,
             },
+            // a func-typed local (`listen := func(..) Listener {..}; listen(..)`)
+            TypeExpr::Named(func) => go_resolve_text(index, fi, go_func_result(func)?),
             _ => None,
         },
         TypeExpr::Elem(inner) => match go_resolve(index, fi, inner, d)? {
-            GoType::Container(t, cf) => go_resolve_text(index, cf, &t),
+            GoType::Container(t, cf, _) => go_resolve_text(index, cf, &t),
+            _ => None,
+        },
+        TypeExpr::Key(inner) => match go_resolve(index, fi, inner, d)? {
+            GoType::Container(_, _, RangeKey::Index) => Some(GoType::External("int".to_string())),
+            GoType::Container(t, cf, RangeKey::Elem) => go_resolve_text(index, cf, &t),
+            GoType::Container(_, cf, RangeKey::Of(k)) => go_resolve_text(index, cf, &k),
             _ => None,
         },
         TypeExpr::Param(..) => None, // Go parameters carry their declared types
@@ -2047,6 +2271,63 @@ end
         let show = from("show");
         assert_eq!(show.len(), 1, "every caller passes a Page: {show:#?}");
         assert!(show[0].to.contains("::Page::render#"));
+    }
+
+    #[test]
+    fn go_interface_values_resolve_through_returned_and_stored_concrete_types() {
+        let src = "package p
+type Conn interface{ Close(); Read() }
+type base struct{}
+func (b *base) Close() {}
+func (b *base) Read() {}
+type TCPConn struct{ base }
+type UDPConn struct{ base }
+type fake struct{}
+func (f *fake) Close() {}
+func (f *fake) Read() {}
+func dialTCP() *TCPConn { return &TCPConn{} }
+func dialUDP() *UDPConn { return &UDPConn{} }
+func dial(tcp bool) (c Conn, err error) {
+\tif tcp {
+\t\tc, err = dialTCP(), nil
+\t} else {
+\t\tc = dialUDP()
+\t}
+\treturn
+}
+func Dial() Conn {
+\topen := func(tcp bool) Conn {
+\t\tc, _ := dial(tcp)
+\t\treturn c
+\t}
+\treturn open(true)
+}
+type result struct{ Conn; err error }
+func viaChan() Conn {
+\tch := make(chan result)
+\tgo func() { c, _ := dial(true); ch <- result{Conn: c} }()
+\tfor r := range ch {
+\t\treturn r.Conn
+\t}
+\treturn nil
+}
+func Use(f *fake) {
+\tc := Dial()
+\tc.Close()
+\tviaChan().Read()
+\tvar any Conn = f
+\tany.Close()
+}
+";
+        let mut files = vec![parse_as("p/p.go", Language::Go, src)];
+        let edges = link(&mut files);
+        let from_use: Vec<_> = edges.iter().filter(|e| e.from == id(&files, "Use") && e.kind == "CALLS").collect();
+        let to = |q: &str| from_use.iter().filter(|e| e.to.contains(q)).map(|e| e.confidence).collect::<Vec<_>>();
+        // Dial only ever returns TCPConn/UDPConn, whose Close is the one promoted from base
+        assert_eq!(to("::base::Close#"), ["STATIC_EXACT"], "{from_use:#?}");
+        assert_eq!(to("::base::Read#"), ["STATIC_EXACT"], "through a channel of a struct embedding Conn");
+        // `var any Conn = f` is a plain local: its flows are not tracked, so it is CHA over both
+        assert!(to("::fake::Close#").iter().all(|c| *c == "STATIC_HEURISTIC"), "{from_use:#?}");
     }
 
     #[test]

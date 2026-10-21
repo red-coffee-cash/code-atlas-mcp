@@ -116,16 +116,64 @@ pub fn sync_repository(db: &DbInstance, repo_root: &Path) -> Result<SyncReport> 
 /// packages exactly instead of by directory-name suffix.
 fn assign_go_package_paths(repo_root: &Path, files: &mut [ParsedFile]) {
     let mut cache: HashMap<String, Option<(String, String)>> = HashMap::new();
+    // The repo may be a subtree of a module (a monorepo checkout, a stdlib directory): then the
+    // module's go.mod sits above the root, and in-repo paths extend the root's import path.
+    let mut root_path = None;
+    let mut computed_root = false;
     for f in files.iter_mut().filter(|f| f.language == walker::Language::Go) {
         let dir = f.rel_path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
-        f.package_path = go_module_of(repo_root, &dir, &mut cache).map(|(module, module_dir)| {
-            match dir.strip_prefix(module_dir.as_str()).map(|r| r.trim_start_matches('/')) {
-                Some("") => module,
-                Some(rest) => format!("{module}/{rest}"),
-                None => module,
+        f.package_path = match go_module_of(repo_root, &dir, &mut cache) {
+            Some((module, module_dir)) => {
+                let rest = dir.strip_prefix(module_dir.as_str()).map_or("", |r| r.trim_start_matches('/'));
+                Some(go_join(&go_module_prefix(&module), rest))
             }
-        });
+            None => {
+                if !computed_root {
+                    root_path = go_import_path_of_dir(repo_root);
+                    computed_root = true;
+                }
+                root_path.as_deref().map(|r| go_join(r, &dir))
+            }
+        };
     }
+}
+
+/// The import-path prefix of a module's packages. The standard library's module (`std`) is
+/// imported without a prefix (`net/http`, not `std/net/http`).
+fn go_module_prefix(module: &str) -> String {
+    if module == "std" { String::new() } else { module.to_string() }
+}
+
+fn go_join(prefix: &str, rest: &str) -> String {
+    match (prefix.is_empty(), rest.is_empty()) {
+        (true, _) => rest.to_string(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}/{rest}"),
+    }
+}
+
+/// The import path of `dir` from the nearest go.mod in it or above it.
+fn go_import_path_of_dir(dir: &Path) -> Option<String> {
+    let dir = dir.canonicalize().ok()?;
+    let mut tail: Vec<String> = Vec::new();
+    let mut cur = dir.as_path();
+    loop {
+        if let Some(module) = std::fs::read_to_string(cur.join("go.mod")).ok().and_then(|g| go_mod_module(&g)) {
+            tail.reverse();
+            return Some(go_join(&go_module_prefix(&module), &tail.join("/")));
+        }
+        tail.push(cur.file_name()?.to_string_lossy().into_owned());
+        cur = cur.parent()?;
+    }
+}
+
+fn go_mod_module(gomod: &str) -> Option<String> {
+    gomod.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("module")
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .map(|r| r.trim().trim_matches('"').to_string())
+    })
 }
 
 /// `(module path, repo-relative directory of its go.mod)` for the module containing `dir`.
@@ -137,14 +185,10 @@ fn go_module_of(
     if let Some(hit) = cache.get(dir) {
         return hit.clone();
     }
-    let here = std::fs::read_to_string(repo_root.join(dir).join("go.mod")).ok().and_then(|gomod| {
-        gomod.lines().find_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("module")
-                .filter(|r| r.starts_with(char::is_whitespace))
-                .map(|r| (r.trim().trim_matches('"').to_string(), dir.to_string()))
-        })
-    });
+    let here = std::fs::read_to_string(repo_root.join(dir).join("go.mod"))
+        .ok()
+        .and_then(|gomod| go_mod_module(&gomod))
+        .map(|m| (m, dir.to_string()));
     let found = match here {
         Some(m) => Some(m),
         None if dir.is_empty() => None,

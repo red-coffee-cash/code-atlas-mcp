@@ -102,6 +102,8 @@ pub enum TypeExpr {
     Call(Box<TypeExpr>),
     /// An element of a slice, array or map: `xs[i]`, the value of `range xs`.
     Elem(Box<TypeExpr>),
+    /// The first variable of `range xs`: an index, a map key, or a channel's element.
+    Key(Box<TypeExpr>),
     /// The positional parameter at this index of the named method (of the enclosing class), typed
     /// by the linker from the arguments its callers pass.
     Param(String, usize),
@@ -125,8 +127,17 @@ pub struct TypeFacts {
     /// (class, method) for methods that exist without a `def`: Ruby accessors, `Struct` members,
     /// aliases, delegators, `define_method` with a literal name.
     pub methods: Vec<(String, String)>,
-    /// Classes defined without a `class` keyword (Ruby `Point = Struct.new(:x, :y)`).
+    /// Classes defined without a `class` keyword (Ruby `Point = Struct.new(:x, :y)`), and Go types
+    /// declared inside functions as (name, "struct" | "interface") in `local_types`.
     pub classes: Vec<String>,
+    pub local_types: Vec<(String, &'static str)>,
+    /// (receiver type or "", function, a value it returns): every first value of every `return`,
+    /// with locals expanded to everything assigned to them. `None` is a value of unknown type
+    /// (which makes the function's result set unknown).
+    pub returns: Vec<(String, String, Option<TypeExpr>)>,
+    /// (struct expression, field or `*` for all fields, a value stored there) from keyed composite
+    /// literals and `x.f = v`. `None` is a value of unknown type.
+    pub field_flows: Vec<(TypeExpr, String, Option<TypeExpr>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
