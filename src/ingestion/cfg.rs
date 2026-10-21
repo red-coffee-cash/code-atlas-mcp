@@ -58,6 +58,11 @@ pub trait CfgLang {
     fn classify<'t>(&self, node: Node<'t>, src: &[u8]) -> Stmt<'t>;
     /// Names assigned to or declared mutable inside `node`.
     fn mutated(&self, node: Node, src: &[u8], out: &mut Vec<String>);
+    /// For languages whose protected statements are siblings of the handlers (Ruby's
+    /// `def .. rescue .. end`): the statements of a `Stmt::Try` body. `None` lowers `body` as a block.
+    fn try_body<'t>(&self, _body: Node<'t>) -> Option<Vec<Node<'t>>> {
+        None
+    }
     /// Whether `node` is a postfix-propagation (`?`) expression.
     fn is_try(&self, node: Node) -> bool;
     /// Whether `node` is a call that can panic on failure (unwrap/expect).
@@ -70,8 +75,7 @@ pub fn cfg_lang_for(language: Language) -> Option<&'static dyn CfgLang> {
         Language::Python => Some(&PythonCfg),
         Language::TypeScript => Some(&TypeScriptCfg),
         Language::Go => Some(&GoCfg),
-        // CFG support lands with the frontend; files degrade to a single opaque block.
-        Language::Ruby => None,
+        Language::Ruby => Some(&RubyCfg),
     }
 }
 
@@ -164,7 +168,7 @@ impl<'a> Builder<'a> {
         let mut calls = Vec::new();
         crate::ingestion::parser::walk(node, |n| {
             if (n.kind() == "call_expression" || n.kind() == "call")
-                && let Some(f) = n.child_by_field_name("function")
+                && let Some(f) = n.child_by_field_name("function").or_else(|| n.child_by_field_name("method"))
             {
                 let name = text(f, self.src).rsplit(['.', ':']).next().unwrap_or("").trim().to_string();
                 if !name.is_empty() {
@@ -322,7 +326,10 @@ impl<'a> Builder<'a> {
                 let join = self.new_block(BlockKind::Join);
                 let try_block = self.new_block(BlockKind::Normal);
                 self.edge(cur, try_block, "TRY");
-                let mut normal_end = self.lower(body, try_block);
+                let mut normal_end = match self.lang.try_body(body) {
+                    Some(stmts) => self.seq(stmts, Some(try_block)),
+                    None => self.lower(body, try_block),
+                };
                 if let (Some(e), Some(o)) = (normal_end, orelse) {
                     let else_block = self.new_block(BlockKind::Normal);
                     self.edge(e, else_block, "NEXT");
@@ -1018,6 +1025,165 @@ impl CfgLang for GoCfg {
     }
 }
 
+struct RubyCfg;
+
+/// `a.b = 1` -> `a`; `a[i] += 1` -> `a`; `@x = 1` -> `@x`.
+fn ruby_root<'t>(mut n: Node<'t>) -> Node<'t> {
+    while let Some(inner) = n.child_by_field_name("receiver").or_else(|| n.child_by_field_name("object")) {
+        n = inner;
+    }
+    n
+}
+
+const RUBY_CLAUSES: &[&str] = &["rescue", "else", "ensure"];
+
+fn ruby_stmts<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    named_children(node).into_iter().filter(|c| c.kind() != "comment").collect()
+}
+
+fn ruby_has_clauses(node: Node) -> bool {
+    named_children(node).iter().any(|c| RUBY_CLAUSES.contains(&c.kind()))
+}
+
+impl CfgLang for RubyCfg {
+    fn body<'t>(&self, def: Node<'t>) -> Option<Node<'t>> {
+        def.child_by_field_name("body")
+    }
+
+    fn statements<'t>(&self, block: Node<'t>) -> Vec<Node<'t>> {
+        ruby_stmts(block)
+    }
+
+    fn try_body<'t>(&self, body: Node<'t>) -> Option<Vec<Node<'t>>> {
+        Some(ruby_stmts(body).into_iter().filter(|c| !RUBY_CLAUSES.contains(&c.kind())).collect())
+    }
+
+    fn classify<'t>(&self, node: Node<'t>, src: &[u8]) -> Stmt<'t> {
+        // `unless` runs its branch when the condition is false; a no-op `then` (the condition itself,
+        // already absorbed) puts the branch on the FALSE edge.
+        let unless = |cond: Node<'t>, body: Option<Node<'t>>, other: Option<Node<'t>>| match (body, other) {
+            (Some(b), Some(o)) => Stmt::If { cond, then: o, otherwise: Some(b) },
+            (Some(b), None) => Stmt::If { cond, then: cond, otherwise: Some(b) },
+            _ => Stmt::Simple,
+        };
+        match node.kind() {
+            "then" | "else" | "ensure" | "do" | "block_body" => Stmt::Block(node),
+            "begin" | "body_statement" => {
+                if !ruby_has_clauses(node) {
+                    return Stmt::Block(node);
+                }
+                let mut handlers = Vec::new();
+                let (mut orelse, mut finalizer) = (None, None);
+                for c in named_children(node) {
+                    match c.kind() {
+                        "rescue" => {
+                            let pattern = c.child_by_field_name("exceptions").map_or("StandardError", |e| text(e, src));
+                            handlers.push((pattern.to_string(), c.child_by_field_name("body").unwrap_or(c)));
+                        }
+                        "else" => orelse = Some(c),
+                        "ensure" => finalizer = Some(c),
+                        _ => {}
+                    }
+                }
+                Stmt::Try { body: node, handlers, orelse, finalizer }
+            }
+            "if" | "elsif" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
+                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: node.child_by_field_name("alternative") },
+                _ => Stmt::Simple,
+            },
+            "unless" => match node.child_by_field_name("condition") {
+                Some(cond) => {
+                    unless(cond, node.child_by_field_name("consequence"), node.child_by_field_name("alternative"))
+                }
+                None => Stmt::Simple,
+            },
+            "if_modifier" => match (node.child_by_field_name("condition"), node.child_by_field_name("body")) {
+                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: None },
+                _ => Stmt::Simple,
+            },
+            "unless_modifier" => match node.child_by_field_name("condition") {
+                Some(cond) => unless(cond, node.child_by_field_name("body"), None),
+                None => Stmt::Simple,
+            },
+            "while" | "until" | "while_modifier" | "until_modifier" => {
+                match (node.child_by_field_name("condition"), node.child_by_field_name("body")) {
+                    (cond, Some(body)) => Stmt::Loop { cond, body },
+                    _ => Stmt::Simple,
+                }
+            }
+            "for" => match node.child_by_field_name("body") {
+                Some(body) => Stmt::Loop { cond: node.child_by_field_name("value"), body },
+                None => Stmt::Simple,
+            },
+            "case" | "case_match" => {
+                let arms = named_children(node)
+                    .into_iter()
+                    .filter(|c| matches!(c.kind(), "when" | "in_clause" | "else"))
+                    .map(|c| {
+                        let pattern = match c.kind() {
+                            "else" => "else".to_string(),
+                            _ => {
+                                let pats: Vec<&str> =
+                                    field_children(c, "pattern").into_iter().map(|p| text(p, src)).collect();
+                                if pats.is_empty() {
+                                    text(c, src).lines().next().unwrap_or("").to_string()
+                                } else {
+                                    pats.join(", ")
+                                }
+                            }
+                        };
+                        let body = if c.kind() == "else" { c } else { c.child_by_field_name("body").unwrap_or(c) };
+                        (pattern, body)
+                    })
+                    .collect();
+                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms, breakable: false }
+            }
+            "call" if node.child_by_field_name("receiver").is_none() => {
+                let method = node.child_by_field_name("method").map_or("", |m| text(m, src));
+                match method {
+                    "raise" | "fail" => Stmt::Panic,
+                    "loop" => match node.child_by_field_name("block").and_then(|b| b.child_by_field_name("body")) {
+                        Some(body) => Stmt::Loop { cond: None, body },
+                        None => Stmt::Simple,
+                    },
+                    _ => Stmt::Simple,
+                }
+            }
+            "return" => Stmt::Return,
+            "break" => Stmt::Break,
+            "next" => Stmt::Continue,
+            _ => Stmt::Simple,
+        }
+    }
+
+    fn mutated(&self, node: Node, src: &[u8], out: &mut Vec<String>) {
+        crate::ingestion::parser::walk(node, |n| {
+            if matches!(n.kind(), "assignment" | "operator_assignment")
+                && let Some(l) = n.child_by_field_name("left")
+            {
+                let targets = if l.kind() == "left_assignment_list" { named_children(l) } else { vec![l] };
+                for t in targets {
+                    let name = text(ruby_root(t), src);
+                    if !name.is_empty() && name != "_" {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn is_try(&self, _node: Node) -> bool {
+        false
+    }
+
+    fn is_panicking_call(&self, node: Node, src: &[u8]) -> bool {
+        node.kind() == "call"
+            && node.child_by_field_name("receiver").is_none()
+            && node.child_by_field_name("method").is_some_and(|m| matches!(text(m, src), "exit" | "exit!" | "abort"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,5 +1503,63 @@ mod tests {
         );
         assert_eq!(c.blocks[0].mutated, ["total", "s"]);
         assert!(has(&c, "PANIC_OR_THROW"), "{:?}", labels(&c));
+    }
+
+    fn rb(src: &str, name: &str) -> Cfg {
+        cfg_in("t.rb", Language::Ruby, src, &["method", "singleton_method"], name)
+    }
+
+    #[test]
+    fn ruby_if_elsif_else_unless_and_modifiers() {
+        let c = rb(
+            "def f(a, b)\n  if a\n    x1\n    one()\n  elsif b\n    two()\n  else\n    three()\n  end\n  four() unless a\n  five() if b\n  return 1\nend\n",
+            "f",
+        );
+        // if, elsif, unless (branch on the FALSE edge), if-modifier
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("TRUE_BRANCH")).count(), 4, "{:?}", labels(&c));
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("FALSE_BRANCH")).count(), 4, "{:?}", labels(&c));
+        for call in ["one", "two", "three", "four", "five"] {
+            assert!(c.blocks.iter().any(|b| b.calls.contains(&call.to_string())), "{call}");
+        }
+        assert!(has(&c, "EARLY_RETURN"));
+    }
+
+    #[test]
+    fn ruby_loops_break_next_raise_and_loop_do() {
+        let c = rb(
+            "def f(xs)\n  for x in xs do\n    next if x < 0\n    break if x == 0\n  end\n  while pending() do\n    step()\n  end\n  loop do\n    raise 'boom' if done()\n  end\nend\n",
+            "f",
+        );
+        assert_eq!(c.blocks.iter().filter(|b| b.kind == BlockKind::LoopHeader).count(), 3);
+        assert!(has(&c, "LOOP_EXIT") && has(&c, "LOOP_BACKEDGE") && has(&c, "PANIC_OR_THROW"), "{:?}", labels(&c));
+    }
+
+    #[test]
+    fn ruby_method_level_rescue_else_ensure() {
+        let c = rb(
+            "def f\n  a()\n  b()\nrescue ArgumentError => e\n  handle(e)\n  return 1\nrescue\n  other()\nelse\n  fine()\nensure\n  cleanup()\nend\n",
+            "f",
+        );
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("EXCEPTION(")).count(), 2, "{:?}", labels(&c));
+        assert!(has(&c, "TRY") && has(&c, "EARLY_RETURN"));
+        for call in ["a", "b", "handle", "other", "fine", "cleanup"] {
+            assert!(c.blocks.iter().any(|b| b.calls.contains(&call.to_string())), "{call}");
+        }
+    }
+
+    #[test]
+    fn ruby_begin_block_case_and_mutation() {
+        let c = rb(
+            "def f(cmd)\n  @n = 0\n  @n += 1\n  self.total = @n\n  begin\n    risky()\n  rescue StandardError\n    recover()\n  end\n  case cmd\n  when 'a' then go()\n  when 'b', 'c' then run()\n  else stop()\n  end\n  exit(1)\nend\n",
+            "f",
+        );
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("MATCH_ARM")).count(), 3, "{:?}", labels(&c));
+        assert!(c.edges.iter().any(|e| e.label == "MATCH_ARM('b', 'c')"), "{:?}", labels(&c));
+        assert!(
+            c.blocks.iter().any(|b| b.mutated == ["@n", "self"]),
+            "{:?}",
+            c.blocks.iter().map(|b| &b.mutated).collect::<Vec<_>>()
+        );
+        assert!(has(&c, "EXCEPTION(StandardError)") && has(&c, "PANIC_OR_THROW"));
     }
 }

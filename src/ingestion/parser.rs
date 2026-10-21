@@ -324,13 +324,14 @@ fn extract_calls(
                     })
                     .flatten()
             });
+            let symbol_ref = r.kind() == "simple_symbol";
             out.calls.push(CallSite {
                 from_symbol_id: from,
-                target_name: text(r, src).to_string(),
+                target_name: text(r, src).trim_start_matches(':').to_string(),
                 receiver: qualifier.map(|q| snippet(q, src)),
                 line,
                 snippet: snippet(r.parent().unwrap_or(r), src),
-                kind: CallKind::Callback,
+                kind: if symbol_ref { CallKind::SymbolRef } else { CallKind::Callback },
                 via: cap("call.callback_via").map(|v| last_segment(text(v, src)).to_string()),
             });
         } else if let (Some(name), Some(tokens)) = (cap("macro.name"), cap("macro.tokens")) {

@@ -33,6 +33,9 @@ pub enum CallKind {
     Direct,
     /// Identifier passed as an argument: `get(login_handler)` (spec §10.2)
     Callback,
+    /// Method name passed as a symbol (`before_action :authorize`, `send(:run)`); it names a
+    /// method of the caller's own class at least as often as a free function (Ruby).
+    SymbolRef,
     /// Identifier inside a macro `token_tree` (spec §10.3)
     MacroIdent,
 }

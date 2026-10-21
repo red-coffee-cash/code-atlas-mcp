@@ -257,6 +257,19 @@ fn narrow_by_receiver(
     cands.into_iter().filter(|&r| index.sym(r).kind == "method").collect()
 }
 
+/// `self`/`this`/`Self`, or the receiver variable of a Go method (`func (s *Server) Run()` -> `s`).
+fn is_self_receiver(caller: &ParsedSymbol, receiver: &str) -> bool {
+    let receiver = receiver.trim();
+    if matches!(receiver, "self" | "Self" | "this") {
+        return true;
+    }
+    caller
+        .signature
+        .strip_prefix("func (")
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|name| name == receiver)
+}
+
 fn pick_tier(index: &Index, caller_file: usize, cands: &[SymRef]) -> Option<(Vec<SymRef>, Tier)> {
     let tiers: [Vec<SymRef>; 3] = [
         cands.iter().copied().filter(|r| r.0 == caller_file).collect(),
@@ -310,10 +323,26 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
             let name = index.aliases[fi].get(call.target_name.as_str()).copied().unwrap_or(call.target_name.as_str());
             // A bare `f(..)` or bare identifier argument can only name a free function; methods need a
             // receiver or qualifier (`x.f()`, `Self::f`, `self.f`).
-            let kinds: &[&str] = if call.receiver.is_none() { &["fn"] } else { CALLABLE };
+            //
+            // Ruby is the exception: a receiver-less call inside a class is a self-call to one of its
+            // methods, and a symbol argument (`before_action :authorize`) names a method too.
+            let ruby_self = file.language == Language::Ruby && call.receiver.is_none();
+            let kinds: &[&str] = if call.receiver.is_none() && !ruby_self { &["fn"] } else { CALLABLE };
             let mut cands = index.candidates(name, kinds);
             if cands.is_empty() {
                 continue;
+            }
+            if ruby_self {
+                // Same-class tier first; otherwise fall back to the generic tiers (inherited methods,
+                // mixins and top-level functions all resolve heuristically).
+                let own: Vec<SymRef> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&r| index.sym(r).kind == "method" && scope_of(index.sym(r)) == scope_of(caller))
+                    .collect();
+                if !own.is_empty() {
+                    cands = own;
+                }
             }
             if let Some(r) = &call.receiver {
                 cands = narrow_by_receiver(index, caller, fi, r, cands);
@@ -335,8 +364,15 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
                 continue;
             };
             let conf = if tier == Tier::Exact { "STATIC_EXACT" } else { "STATIC_HEURISTIC" };
+            // `fd.inner.Close()` inside `Close` delegates to another value that happens to share the
+            // method name; only a call on the receiver itself can be real recursion.
+            let delegating = call.kind == CallKind::SymbolRef
+                || call.receiver.as_deref().is_some_and(|r| !is_self_receiver(caller, r));
             for t in targets {
                 let target = index.sym(t);
+                if delegating && target.symbol_id == caller.symbol_id {
+                    continue;
+                }
                 acc.add(&caller.symbol_id, &target.symbol_id, "CALLS", conf, call.line, &call.snippet);
                 if call.kind == CallKind::Callback && call.via.as_deref().is_some_and(|v| ROUTE_REGISTRARS.contains(&v))
                 {
@@ -439,6 +475,66 @@ mod tests {
         assert_eq!(normalize_module("app.billing"), "app::billing");
         assert_eq!(module_key("internal/auth/jwt.go"), "internal::auth");
         assert_eq!(module_key("main.go"), "");
+    }
+
+    #[test]
+    fn ruby_self_calls_and_symbol_refs_resolve_to_same_class_methods() {
+        let mk = |path: &str, src: &str| {
+            parse_file(&SourceFile {
+                rel_path: path.into(),
+                language: Language::Ruby,
+                source: src.into(),
+                blake3: String::new(),
+                line_count: 0,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let mut files = vec![
+            mk(
+                "app/a.rb",
+                "class A < Base\n  before_action :check\n  def run\n    step(1)\n    send(:check)\n    self.step(2)\n    Util.helper\n  end\n  def step(n); end\n  def check; end\nend\n",
+            ),
+            mk("app/b.rb", "class B\n  def step(n); end\n  def check; end\nend\nclass Base; end\n"),
+            mk("app/util.rb", "class Util\n  def self.helper; end\nend\n"),
+        ];
+        let edges = link(&mut files);
+        let a = |name: &str| files[0].symbols.iter().find(|s| s.name == name).unwrap().symbol_id.clone();
+        let calls =
+            |from: &str, to: &str| edges.iter().any(|e| e.from == a(from) && e.to == a(to) && e.kind == "CALLS");
+        assert!(calls("run", "step"), "{edges:#?}");
+        assert!(calls("run", "check"), "send(:check) names a method of the same class");
+        let b_step = files[1].symbols.iter().find(|s| s.name == "step").unwrap().symbol_id.clone();
+        assert!(!edges.iter().any(|e| e.from == a("run") && e.to == b_step), "other class's step is not a candidate");
+        assert!(edges.iter().any(|e| e.from == a("run") && e.to == id(&files, "helper")));
+        let ext = edges.iter().find(|e| e.from == id(&files, "A") && e.to == id(&files, "Base")).unwrap();
+        assert_eq!(ext.kind, "IMPLEMENTS");
+    }
+
+    #[test]
+    fn delegation_to_a_same_named_method_on_another_value_is_not_recursion() {
+        let mk = |path: &str, lang, src: &str| {
+            parse_file(&SourceFile {
+                rel_path: path.into(),
+                language: lang,
+                source: src.into(),
+                blake3: String::new(),
+                line_count: 0,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let mut files = vec![mk(
+            "a.go",
+            Language::Go,
+            "package p\ntype T struct{ inner I }\nfunc (t *T) Close() { t.inner.Close() }\nfunc (t *T) Walk(n int) { if n > 0 { t.Walk(n - 1) } }\n",
+        )];
+        let edges = link(&mut files);
+        assert!(!edges.iter().any(|e| e.from == id(&files, "Close") && e.to == id(&files, "Close")));
+        assert!(
+            edges.iter().any(|e| e.from == id(&files, "Walk") && e.to == id(&files, "Walk")),
+            "real recursion on the receiver stays"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ An MCP server that lets an LLM build, persist and query a layered structural and
 codebase, for bug hunting, security auditing and architecture questions. Design: see
 [`code-atlas-mcp-spec.md`](code-atlas-mcp-spec.md).
 
-* **Phase 0, skeleton (automatic):** tree-sitter parsing of Rust, Python, TypeScript/JavaScript and Go
+* **Phase 0, skeleton (automatic):** tree-sitter parsing of Rust, Python, TypeScript/JavaScript, Go and Ruby
   extracts symbols, signatures, complexity, risk flags and a static call graph in seconds.
 * **Phase 1, Cartographer (an agent):** works through a bottom-up queue, writes intent, mechanism and
   adversarial *assumed invariants* per symbol, resolves ambiguous edges, then records module rollups
@@ -98,6 +98,21 @@ rollups, flows), then the Auditor prompt.
   so a same-named package from another module can produce a heuristic edge.
 * Only the first name of `const A, B = 1, 2` becomes a symbol. `goto` and labels are treated as simple
   statements in CFGs.
+
+### Ruby notes
+* Classes and modules are both kind `class` (disambiguated by scope); `class Foo::Bar` is the symbol
+  `Bar` under scope `Foo`. Constants at top level or in a class body are `const`; locals and `@ivars`
+  are not symbols. `def self.x` and an instance `x` get distinct IDs through the line marker.
+* Visibility follows bare `private`/`protected`/`public`, `private :a`, `private def x` and
+  `private_class_method`; `protected` is reported as `private`.
+* `class A < B` and `include`/`extend`/`prepend M` become `IMPLEMENTS` edges. `require`/`require_relative`/
+  `load`/`autoload` with literal paths are imports.
+* Receiver-less calls inside a class resolve to that class's methods first. Method names passed as
+  symbols (`before_action :x`, `send(:x)`, `&:x`) are `SymbolRef` edges.
+* Not modelled: paren-less bare self-calls (`helper` is indistinguishable from a local variable),
+  `define_method`, `method_missing`, `Struct.new` classes, `Module#prepend` ordering, and block-style
+  routes (`get '/x' do`, `task :x do`), whose bodies belong to the enclosing symbol. Expect many
+  heuristic edges (duck typing).
 
 ## Development
 

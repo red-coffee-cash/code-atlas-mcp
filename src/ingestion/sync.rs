@@ -294,6 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn ruby_files_sync_with_self_calls_mixins_and_vendor_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/mixin.rb", "module Mixin\n  def shared; end\nend\n");
+        write(
+            dir.path(),
+            "app/controllers/users_controller.rb",
+            "require 'mixin'\nclass UsersController < ApplicationController\n  include Mixin\n  before_action :auth\n  def index\n    load_users()\n  end\n  private\n  def auth; end\n  def load_users; end\nend\n",
+        );
+        write(dir.path(), "Rakefile", "def helper; end\n");
+        write(dir.path(), "vendor/bundle/gem.rb", "class Gem; end\n");
+        let db = schema::open_in_memory().unwrap();
+
+        let r = sync_repository(&db, dir.path()).unwrap();
+        assert_eq!((r.files_scanned, r.files_parsed, r.files_unsupported), (3, 3, 0));
+        let ep = run(&db, "?[n] := *symbol_node{name: n, is_entrypoint: true}");
+        assert_eq!(ep.len(), 1, "{ep:?}");
+        assert_eq!(ep[0][0].get_str(), Some("index"));
+        let calls = run(
+            &db,
+            "?[a, b] := *symbol_edge{from_symbol_id: x, to_symbol_id: y, edge_kind: 'CALLS'}, *symbol_node{symbol_id: x, name: a}, *symbol_node{symbol_id: y, name: b}",
+        );
+        let has = |a: &str, b: &str| calls.iter().any(|r| r[0].get_str() == Some(a) && r[1].get_str() == Some(b));
+        assert!(has("index", "load_users"), "{calls:?}");
+    }
+
+    #[test]
     fn resync_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/lib.rs", SRC);
