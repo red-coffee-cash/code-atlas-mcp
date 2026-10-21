@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::model::{CallKind, ParsedFile, ParsedSymbol, TypeRefKind};
+use super::walker::Language;
 
 /// Beyond this many candidates a name is too generic (`clone`, `to_string`) to link.
 const MAX_HEURISTIC_CANDIDATES: usize = 8;
@@ -91,6 +92,11 @@ pub fn link(files: &mut [ParsedFile]) -> Vec<Edge> {
 
 /// `src/auth/mod.rs` -> `auth`, `app/billing/stripe.py` -> `app::billing::stripe`
 fn module_key(rel_path: &str) -> String {
+    // A Go package is a directory: every `.go` file in it shares one key.
+    if let Some(dir) = rel_path.strip_suffix(".go") {
+        let dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        return dir.split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+    }
     let stem = rel_path.rsplit_once('.').map_or(rel_path, |(s, _)| s);
     let mut parts: Vec<&str> = stem.split('/').collect();
     if matches!(parts.first(), Some(&"src") | Some(&"lib")) {
@@ -155,6 +161,11 @@ impl<'a> Index<'a> {
                     let joined = if module.is_empty() { imp.name.clone() } else { format!("{module}::{}", imp.name) };
                     targets.extend(index.files_for_module(&joined));
                 }
+                // Go imports are full module paths (`github.com/acme/app/auth`) that end in the
+                // repo-relative package directory, the reverse of the other languages.
+                if f.language == Language::Go {
+                    targets.extend(index.files_for_import_path(&module));
+                }
                 index.imported_files[fi].extend(targets.into_iter().filter(|&t| t != fi));
                 if let Some(alias) = &imp.alias {
                     index.aliases[fi].insert(alias.as_str(), imp.name.as_str());
@@ -187,6 +198,16 @@ impl<'a> Index<'a> {
         out
     }
 
+    fn files_for_import_path(&self, module: &str) -> Vec<usize> {
+        let suffix_of = |key: &str| !key.is_empty() && (module == key || module.ends_with(&format!("::{key}")));
+        self.module_keys
+            .iter()
+            .enumerate()
+            .filter(|(i, k)| suffix_of(k) && self.files[*i].language == Language::Go)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn sym(&self, r: SymRef) -> &'a ParsedSymbol {
         &self.files[r.0].symbols[r.1]
     }
@@ -212,6 +233,8 @@ fn narrow_by_receiver(
     cands: Vec<SymRef>,
 ) -> Vec<SymRef> {
     let segment = receiver.rsplit("::").next().unwrap_or(receiver).trim();
+    // `str.ToUpper(..)` after `import str "strings"`: the receiver is an alias for the package.
+    let segment = index.aliases[caller_file].get(segment).copied().unwrap_or(segment);
     let narrowed: Vec<SymRef> = if matches!(segment, "self" | "Self" | "this") {
         cands.iter().copied().filter(|&r| r.0 == caller_file && scope_of(index.sym(r)) == scope_of(caller)).collect()
     } else {
@@ -414,6 +437,55 @@ mod tests {
         assert_eq!(normalize_module("crate::auth::jwt"), "auth::jwt");
         assert_eq!(normalize_module("super::x"), "x");
         assert_eq!(normalize_module("app.billing"), "app::billing");
+        assert_eq!(module_key("internal/auth/jwt.go"), "internal::auth");
+        assert_eq!(module_key("main.go"), "");
+    }
+
+    #[test]
+    fn go_package_qualified_calls_resolve_through_import_paths_and_aliases() {
+        let mk = |path: &str, src: &str| {
+            parse_file(&SourceFile {
+                rel_path: path.into(),
+                language: Language::Go,
+                source: src.into(),
+                blake3: String::new(),
+                line_count: 0,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let mut files = vec![
+            mk("internal/auth/verify.go", "package auth\nfunc Verify() {}\nfunc helper() {}\nfunc Run() { helper() }"),
+            mk("internal/other/verify.go", "package other\nfunc Verify() {}"),
+            mk(
+                "cmd/main.go",
+                "package main\nimport (\n\ta \"github.com/acme/app/internal/auth\"\n)\nfunc main() { a.Verify() }\nfunc plain() { Verify() }",
+            ),
+            mk(
+                "cmd/other.go",
+                "package main\nimport \"github.com/acme/app/internal/auth\"\nfunc two() { auth.Verify() }",
+            ),
+        ];
+        let edges = link(&mut files);
+        let verify_in = |dir: &str| {
+            files
+                .iter()
+                .find(|f| f.rel_path.contains(dir))
+                .unwrap()
+                .symbols
+                .iter()
+                .find(|s| s.name == "Verify")
+                .unwrap()
+                .symbol_id
+                .clone()
+        };
+        let from = |name: &str| id(&files, name);
+        let to_auth = edges.iter().find(|e| e.from == from("main") && e.to == verify_in("auth")).expect("alias call");
+        assert_eq!(to_auth.confidence, "STATIC_EXACT");
+        assert!(!edges.iter().any(|e| e.from == from("main") && e.to == verify_in("other")));
+        assert!(edges.iter().any(|e| e.from == from("two") && e.to == verify_in("auth")));
+        // same-package call across files of one directory still works via the same-file tier
+        assert!(edge(&edges, &files, "Run", "helper", "CALLS").is_some());
     }
 
     #[test]

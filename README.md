@@ -4,7 +4,7 @@ An MCP server that lets an LLM build, persist and query a layered structural and
 codebase, for bug hunting, security auditing and architecture questions. Design: see
 [`code-atlas-mcp-spec.md`](code-atlas-mcp-spec.md).
 
-* **Phase 0, skeleton (automatic):** tree-sitter parsing of Rust, Python and TypeScript/JavaScript
+* **Phase 0, skeleton (automatic):** tree-sitter parsing of Rust, Python, TypeScript/JavaScript and Go
   extracts symbols, signatures, complexity, risk flags and a static call graph in seconds.
 * **Phase 1, Cartographer (an agent):** works through a bottom-up queue, writes intent, mechanism and
   adversarial *assumed invariants* per symbol, resolves ambiguous edges, then records module rollups
@@ -86,8 +86,18 @@ rollups, flows), then the Auditor prompt.
 * `ast_blake3` hashes token *kind names*, not numeric kind ids, so hashes survive grammar upgrades.
 * Entrypoints are detected from definitions (`main`, route/CLI decorators and attributes, FFI exports)
   and from handlers passed to route-registering calls.
-* Not implemented: the optional LSP/SCIP enrichment pass (`enrich_edges_via_lsp`), Go/C/C++/Java
+* Not implemented: the optional LSP/SCIP enrichment pass (`enrich_edges_via_lsp`), C/C++/Java
   frontends, and `MUTATES_STATE`/`READS_STATE` inference (the Cartographer can add those edges).
+
+### Go notes
+* Package-level `func`, methods (scoped by receiver type), `type`, `const` and `var` are symbols;
+  locals and closures are not. Visibility is `pub` iff the name is exported.
+* Interfaces are structural, so no `IMPLEMENTS` edges are emitted for Go yet.
+* `vendor/` directories are skipped for Go (and Ruby) files.
+* Import paths are matched to repo packages by directory suffix (module path from `go.mod` is not read),
+  so a same-named package from another module can produce a heuristic edge.
+* Only the first name of `const A, B = 1, 2` becomes a symbol. `goto` and labels are treated as simple
+  statements in CFGs.
 
 ## Development
 

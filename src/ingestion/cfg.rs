@@ -69,8 +69,9 @@ pub fn cfg_lang_for(language: Language) -> Option<&'static dyn CfgLang> {
         Language::Rust => Some(&RustCfg),
         Language::Python => Some(&PythonCfg),
         Language::TypeScript => Some(&TypeScriptCfg),
-        // CFG support for these lands with their frontends; files degrade to a single opaque block.
-        Language::Go | Language::Ruby => None,
+        Language::Go => Some(&GoCfg),
+        // CFG support lands with the frontend; files degrade to a single opaque block.
+        Language::Ruby => None,
     }
 }
 
@@ -899,6 +900,124 @@ impl CfgLang for TypeScriptCfg {
     }
 }
 
+struct GoCfg;
+
+/// `a.b[i].c` -> `a`; `*p` -> `p`.
+fn go_root<'t>(mut n: Node<'t>) -> Node<'t> {
+    loop {
+        match n.child_by_field_name("operand") {
+            Some(inner) => n = inner,
+            None if n.kind() == "parenthesized_expression" => match n.named_child(0) {
+                Some(inner) => n = inner,
+                None => return n,
+            },
+            None => return n,
+        }
+    }
+}
+
+/// The statements of a `block`/`statement_list`, or of a case clause.
+fn go_statements<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let list = if node.kind() == "statement_list" {
+        Some(node)
+    } else {
+        named_children(node).into_iter().find(|c| c.kind() == "statement_list")
+    };
+    list.map(|l| named_children(l).into_iter().filter(|c| c.kind() != "comment").collect()).unwrap_or_default()
+}
+
+fn go_callee<'a>(node: Node, src: &'a [u8]) -> Option<&'a str> {
+    (node.kind() == "call_expression").then(|| node.child_by_field_name("function")).flatten().map(|f| text(f, src))
+}
+
+impl CfgLang for GoCfg {
+    fn body<'t>(&self, def: Node<'t>) -> Option<Node<'t>> {
+        def.child_by_field_name("body")
+    }
+
+    fn statements<'t>(&self, block: Node<'t>) -> Vec<Node<'t>> {
+        go_statements(block)
+    }
+
+    fn classify<'t>(&self, node: Node<'t>, src: &[u8]) -> Stmt<'t> {
+        let arms = |node: Node<'t>| -> Vec<(String, Node<'t>)> {
+            named_children(node)
+                .into_iter()
+                .filter(|c| matches!(c.kind(), "expression_case" | "type_case" | "communication_case" | "default_case"))
+                .map(|c| {
+                    let body = named_children(c).into_iter().find(|x| x.kind() == "statement_list").unwrap_or(c);
+                    let pattern = if c.kind() == "default_case" {
+                        "default".to_string()
+                    } else {
+                        let end = body.start_byte().max(c.start_byte());
+                        let head = String::from_utf8_lossy(&src[c.start_byte()..end.min(c.end_byte())]).to_string();
+                        head.trim().trim_start_matches("case").trim().trim_end_matches(':').trim().to_string()
+                    };
+                    (pattern, body)
+                })
+                .collect()
+        };
+        match node.kind() {
+            "block" | "statement_list" => Stmt::Block(node),
+            "if_statement" => match (node.child_by_field_name("condition"), node.child_by_field_name("consequence")) {
+                (Some(cond), Some(then)) => Stmt::If { cond, then, otherwise: node.child_by_field_name("alternative") },
+                _ => Stmt::Simple,
+            },
+            "for_statement" => match node.child_by_field_name("body") {
+                Some(body) => {
+                    let clause =
+                        named_children(node).into_iter().find(|c| matches!(c.kind(), "for_clause" | "range_clause"));
+                    let cond = clause
+                        .and_then(|c| c.child_by_field_name("condition").or_else(|| c.child_by_field_name("right")));
+                    Stmt::Loop { cond: cond.or_else(|| node.child_by_field_name("condition")), body }
+                }
+                None => Stmt::Simple,
+            },
+            "expression_switch_statement" | "type_switch_statement" => {
+                Stmt::Match { scrutinee: node.child_by_field_name("value"), arms: arms(node), breakable: true }
+            }
+            "select_statement" => Stmt::Match { scrutinee: None, arms: arms(node), breakable: true },
+            "return_statement" => Stmt::Return,
+            "break_statement" => Stmt::Break,
+            "continue_statement" => Stmt::Continue,
+            "expression_statement"
+                if node.named_child(0).and_then(|c| go_callee(c, src)).is_some_and(|f| f == "panic") =>
+            {
+                Stmt::Panic
+            }
+            _ => Stmt::Simple,
+        }
+    }
+
+    fn mutated(&self, node: Node, src: &[u8], out: &mut Vec<String>) {
+        crate::ingestion::parser::walk(node, |n| {
+            let targets: Vec<Node> = match n.kind() {
+                "short_var_declaration" | "assignment_statement" => {
+                    n.child_by_field_name("left").map(named_children).unwrap_or_default()
+                }
+                "inc_statement" | "dec_statement" => n.named_child(0).into_iter().collect(),
+                _ => Vec::new(),
+            };
+            for t in targets {
+                let name = text(go_root(t), src);
+                if name != "_" && !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+            true
+        });
+    }
+
+    fn is_try(&self, _node: Node) -> bool {
+        false
+    }
+
+    fn is_panicking_call(&self, node: Node, src: &[u8]) -> bool {
+        // a bare `panic(..)` statement is lowered to `Stmt::Panic` instead
+        go_callee(node, src).is_some_and(|f| f == "os.Exit" || f.starts_with("log.Fatal") || f.starts_with("log.Panic"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,5 +1288,54 @@ mod tests {
         assert_eq!(c.blocks[0].mutated, ["n"]);
         let e = ts("const g = (a: number) => helper(a);\n", "g");
         assert!(e.blocks[0].calls == ["helper"]);
+    }
+
+    fn go(src: &str, name: &str) -> Cfg {
+        cfg_in("t.go", Language::Go, src, &["function_declaration", "method_declaration"], name)
+    }
+
+    #[test]
+    fn go_if_else_chain_with_initializer() {
+        let c = go(
+            "package p\nfunc f(a, b bool) int {\n\tif x := g(); a {\n\t\tx1()\n\t} else if b {\n\t\ty1()\n\t} else {\n\t\tz1()\n\t}\n\treturn 1\n}\n",
+            "f",
+        );
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("TRUE_BRANCH")).count(), 2, "{:?}", labels(&c));
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("FALSE_BRANCH")).count(), 2);
+        for call in ["x1", "y1", "z1"] {
+            assert!(c.blocks.iter().any(|b| b.calls == [call]), "{call}");
+        }
+        assert!(has(&c, "EARLY_RETURN"));
+    }
+
+    #[test]
+    fn go_loops_break_continue_and_panic() {
+        let c = go(
+            "package p\nfunc f(xs []int) {\n\tfor _, x := range xs {\n\t\tif x < 0 {\n\t\t\tcontinue\n\t\t}\n\t\tif x == 0 {\n\t\t\tbreak\n\t\t}\n\t\tif x > 9 {\n\t\t\tpanic(\"big\")\n\t\t}\n\t}\n\tfor pending() {\n\t\tstep()\n\t}\n}\n",
+            "f",
+        );
+        assert_eq!(c.blocks.iter().filter(|b| b.kind == BlockKind::LoopHeader).count(), 2);
+        assert!(has(&c, "LOOP_EXIT") && has(&c, "LOOP_BACKEDGE") && has(&c, "PANIC_OR_THROW"));
+    }
+
+    #[test]
+    fn go_switch_select_and_type_switch_arms() {
+        let c = go(
+            "package p\nfunc f(x int, i any, ch chan int) {\n\tswitch x {\n\tcase 1, 2:\n\t\ta()\n\tdefault:\n\t\tb()\n\t}\n\tswitch v := i.(type) {\n\tcase int:\n\t\tc(v)\n\t}\n\tselect {\n\tcase m := <-ch:\n\t\td(m)\n\tdefault:\n\t}\n\tdone()\n}\n",
+            "f",
+        );
+        assert_eq!(c.edges.iter().filter(|e| e.label.starts_with("MATCH_ARM")).count(), 5, "{:?}", labels(&c));
+        assert!(c.edges.iter().any(|e| e.label == "MATCH_ARM(1, 2)"), "{:?}", labels(&c));
+        assert!(c.blocks.iter().any(|b| b.calls.contains(&"done".to_string())));
+    }
+
+    #[test]
+    fn go_mutation_and_exiting_calls() {
+        let c = go(
+            "package p\nfunc f(s *S) {\n\ttotal := 0\n\ttotal++\n\ts.n = total\n\t_ = total\n\tlog.Fatal(\"x\")\n}\n",
+            "f",
+        );
+        assert_eq!(c.blocks[0].mutated, ["total", "s"]);
+        assert!(has(&c, "PANIC_OR_THROW"), "{:?}", labels(&c));
     }
 }

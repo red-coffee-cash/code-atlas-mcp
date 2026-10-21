@@ -274,6 +274,26 @@ mod tests {
     }
 
     #[test]
+    fn go_files_sync_with_cross_package_edges_and_vendor_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "internal/auth/auth.go", "package auth\n\nfunc Verify() {}\n");
+        write(
+            dir.path(),
+            "cmd/app/main.go",
+            "package main\n\nimport \"example.com/app/internal/auth\"\n\nfunc main() { auth.Verify() }\n",
+        );
+        write(dir.path(), "vendor/dep/dep.go", "package dep\n\nfunc Dep() {}\n");
+        let db = schema::open_in_memory().unwrap();
+
+        let r = sync_repository(&db, dir.path()).unwrap();
+        assert_eq!((r.files_scanned, r.files_parsed, r.files_unsupported), (2, 2, 0));
+        assert_eq!((r.symbols_total, r.edges_total), (2, 1));
+        let ep = run(&db, "?[n] := *symbol_node{name: n, is_entrypoint: true}");
+        assert_eq!(ep.len(), 1);
+        assert_eq!(ep[0][0].get_str(), Some("main"));
+    }
+
+    #[test]
     fn resync_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/lib.rs", SRC);

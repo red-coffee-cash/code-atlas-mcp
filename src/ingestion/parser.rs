@@ -141,7 +141,11 @@ fn extract_symbols(fe: &dyn Frontend, query: &Query, root: Node, src: &[u8], fil
                 start: def.start_byte(),
                 end: def.end_byte(),
                 params: range(fe.function_node(def).child_by_field_name("parameters")),
-                ret: range(fe.function_node(def).child_by_field_name("return_type")),
+                ret: range(
+                    fe.function_node(def)
+                        .child_by_field_name("return_type")
+                        .or_else(|| fe.function_node(def).child_by_field_name("result")),
+                ),
             },
             sym: ParsedSymbol {
                 symbol_id,
@@ -312,8 +316,12 @@ fn extract_calls(
             // `Self::handler`, `self.handler`, `mod.handler` carry a qualifier; a bare `handler`
             // can only be a free function (or a local variable).
             let qualifier = r.parent().and_then(|p| {
-                matches!(p.kind(), "scoped_identifier" | "attribute" | "member_expression")
-                    .then(|| p.child_by_field_name("path").or_else(|| p.child_by_field_name("object")))
+                matches!(p.kind(), "scoped_identifier" | "attribute" | "member_expression" | "selector_expression")
+                    .then(|| {
+                        p.child_by_field_name("path")
+                            .or_else(|| p.child_by_field_name("object"))
+                            .or_else(|| p.child_by_field_name("operand"))
+                    })
                     .flatten()
             });
             out.calls.push(CallSite {
