@@ -1,0 +1,32 @@
+[package]
+name = "code-atlas-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+cozo = { version = "0.7.6", features = ["storage-rocksdb", "graph-algo"] }
+fastembed = "7.1.5"
+ignore = "0.4.33"
+petgraph = "0.8.3"
+rmcp = { version = "3.6.0", features = ["macros", "schemars", "server", "transport-io"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+streaming-iterator = "0.1.9"
+thiserror = "2.0.21"
+tokio = { version = "1.54.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tree-sitter = "0.27.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-python = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
