@@ -651,6 +651,11 @@ end
         assert!(sym_refs.iter().any(|c| c.target_name == "authorize" && c.via.as_deref() == Some("send")));
         assert!(sym_refs.iter().any(|c| c.target_name == "authorize" && c.via.as_deref() == Some("before_action")));
         assert!(sym_refs.iter().any(|c| c.target_name == "name" && c.via.as_deref() == Some("map")));
+        let recv = |name: &str, via: &str| {
+            sym_refs.iter().find(|c| c.target_name == name && c.via.as_deref() == Some(via)).unwrap().receiver.clone()
+        };
+        assert_eq!(recv("authorize", "send"), None, "receiver-less send is a self call");
+        assert_eq!(recv("name", "map").as_deref(), Some("items"), "&:name is called on the elements");
 
         let imp = |m: &str, n: &str| p.imports.iter().any(|i| i.module_path == m && i.name == n);
         assert!(imp("", "json") && imp("net", "http") && imp("../lib", "helper"));

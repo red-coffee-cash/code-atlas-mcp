@@ -252,6 +252,17 @@ fn last_segment(t: &str) -> &str {
     t.rsplit([':', '.']).next().unwrap_or(t).trim_end_matches('!')
 }
 
+/// The object a Ruby symbol ref names a method of. `obj.send(:x)` / `obj.try(:x)` -> `obj`;
+/// `send(:x)` and `before_action :x` -> self (`None`); `xs.map(&:x)` calls `x` on each element of
+/// `xs`, never on self, so it gets the placeholder `_` unless the collection has a name.
+fn symbol_ref_receiver(sym: Node, src: &[u8]) -> Option<String> {
+    let parent = sym.parent()?;
+    let to_proc = parent.kind() == "block_argument";
+    let call = if to_proc { parent.parent()?.parent()? } else { parent.parent()? };
+    let named = call.child_by_field_name("receiver").map(|r| snippet(r, src));
+    if to_proc { Some(named.filter(|r| r != "self").unwrap_or_else(|| "_".to_string())) } else { named }
+}
+
 fn extract_calls(
     fe: &dyn Frontend,
     query: &Query,
@@ -326,10 +337,11 @@ fn extract_calls(
                     .flatten()
             });
             let symbol_ref = r.kind() == "simple_symbol";
+            let receiver = if symbol_ref { symbol_ref_receiver(r, src) } else { qualifier.map(|q| snippet(q, src)) };
             out.calls.push(CallSite {
                 from_symbol_id: from,
                 target_name: text(r, src).trim_start_matches(':').to_string(),
-                receiver: qualifier.map(|q| snippet(q, src)),
+                receiver,
                 line,
                 snippet: snippet(r.parent().unwrap_or(r), src),
                 kind: if symbol_ref { CallKind::SymbolRef } else { CallKind::Callback },

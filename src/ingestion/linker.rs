@@ -447,9 +447,15 @@ fn resolve_all(index: &Index) -> (Vec<Edge>, HashSet<String>) {
                 }
                 _ => pick_tier(index, fi, &cands),
             };
-            let Some((targets, tier)) = resolved else {
+            let Some((targets, mut tier)) = resolved else {
                 continue;
             };
+            // `items.map(&:name)` / `other.send(:x)` name a method of an object of unknown type.
+            if call.kind == CallKind::SymbolRef
+                && call.receiver.as_deref().is_some_and(|r| !is_self_receiver(caller, r))
+            {
+                tier = Tier::Heuristic;
+            }
             let conf = if tier == Tier::Exact { "STATIC_EXACT" } else { "STATIC_HEURISTIC" };
             // `fd.inner.Close()` inside `Close` delegates to another value that happens to share the
             // method name; only a call on the receiver itself can be real recursion.
@@ -734,6 +740,20 @@ mod tests {
         assert_eq!(from_user.len(), 1, "{from_user:#?}");
         assert!(from_user[0].to.contains("::User::check#"), "{}", from_user[0].to);
         assert_eq!(from_user[0].confidence, "STATIC_EXACT");
+    }
+
+    #[test]
+    fn ruby_symbol_refs_on_other_objects_are_not_exact_self_calls() {
+        let mut files = vec![parse_as(
+            "app/u.rb",
+            Language::Ruby,
+            "class User\n  def go(items, other)\n    items.map(&:name)\n    other.send(:check)\n    send(:audit)\n  end\n  def name; end\n  def check; end\n  def audit; end\nend\n",
+        )];
+        let edges = link(&mut files);
+        let e = |to: &str| calls_between(&edges, &files, ("app/u.rb", "go"), ("app/u.rb", to));
+        assert_eq!(e("name").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
+        assert_eq!(e("check").map(|e| e.confidence), Some("STATIC_HEURISTIC"));
+        assert_eq!(e("audit").map(|e| e.confidence), Some("STATIC_EXACT"), "receiver-less send stays a self call");
     }
 
     #[test]
